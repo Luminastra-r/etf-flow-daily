@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="全量ETF池资金流向与行业轮动日报">
+  <title>大类 ETF 资金流向日报</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script defer src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
+  <script defer src="assets/charts.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="dashboard">
+  <header class="masthead">
+    <a class="brand" href="index.html"><span class="brand-mark">EF</span><span>ETF FLOW / DAILY</span></a>
+    <nav><a class="active" href="index.html">资金观察</a><a href="market.html">市场环境</a><a href="methodology.html">方法与质量</a></nav>
+  </header>
+  <main>
+    <section class="hero reveal">
+      <div>
+        <p class="eyebrow">全量 ETF 池 · 每日 07:46 CST</p>
+        <h1>资金流不是答案，<br><em>它是市场留下的笔迹。</em></h1>
+        <p class="lede">观察估算资金净流入、价格与广度的共同变化。所有结论均由规则生成，不构成投资建议。</p>
+      </div>
+      <aside class="status-panel" id="status-panel"><span class="skeleton">正在读取数据状态…</span></aside>
+    </section>
+
+    <section class="period-bar reveal">
+      <div><span class="section-index">01</span><h2>观察周期</h2></div>
+      <div class="period-switch" id="period-switch" aria-label="周期选择"></div>
+    </section>
+
+    <section class="kpi-grid reveal" id="kpi-grid"></section>
+    <section class="briefing reveal">
+      <div class="section-head"><span class="section-index">02</span><div><p>RULE-BASED BRIEF</p><h2>今日自动结论</h2></div></div>
+      <div id="auto-brief" class="brief-copy skeleton">正在生成可追溯摘要…</div>
+    </section>
+
+    <section class="split-grid reveal">
+      <article class="panel">
+        <div class="section-head compact"><span class="section-index">03</span><div><p>CONTRIBUTION</p><h2>大类资金贡献</h2></div></div>
+        <div id="category-chart" class="chart"></div>
+      </article>
+      <article class="panel">
+        <div class="section-head compact"><span class="section-index">04</span><div><p>FLOW × PRICE</p><h2>资金价格四象限</h2></div></div>
+        <div id="quadrant-chart" class="chart"></div>
+      </article>
+    </section>
+
+    <section class="panel reveal">
+      <div class="section-head compact"><span class="section-index">05</span><div><p>SECTOR ROTATION</p><h2>行业多指标热力矩阵</h2></div></div>
+      <div class="table-scroll"><table id="industry-table"><thead><tr><th>行业</th><th>估算净流入</th><th>流入率</th><th>资金广度</th><th>区间涨跌</th><th>ETF数</th><th>代表ETF（规模/成交额口径）</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="rankings reveal">
+      <div class="section-head"><span class="section-index">06</span><div><p>RANKING WITHOUT FICTION</p><h2>方向排名</h2></div></div>
+      <div id="ranking-grid"></div>
+    </section>
+  </main>
+  <footer><span>ETF FLOW DAILY</span><span>数据源：AKShare / Baostock</span><span>静态发布 · SQLite 唯一历史库</span></footer>
+</body>
+</html>

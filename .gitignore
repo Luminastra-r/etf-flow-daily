@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+.output-build/
+data/backups/
+data/*.sqlite-wal
+data/*.sqlite-shm

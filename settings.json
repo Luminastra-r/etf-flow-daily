@@ -1,0 +1,40 @@
+{
+  "classification_version": "2026.07-v2",
+  "period_windows": [1, 5, 20, 60],
+  "default_period": 1,
+  "zscore_window": 60,
+  "top_n": 5,
+  "representative_etf_count": 3,
+  "neutral_flow_rate": 0.0001,
+  "neutral_price_return": 0.001,
+  "concentration_min_flow_wan": 100.0,
+  "coverage_warning": 0.95,
+  "coverage_failure": 0.8,
+  "pool_change_warning": 0.2,
+  "share_jump_warning": 0.5,
+  "pct_change_limit": 30.0,
+  "benchmark_deviation_warning": 0.02,
+  "retry_count": 3,
+  "retry_base_seconds": 2,
+  "sqlite_warning_mb": 500,
+  "sqlite_migration_mb": 1024,
+  "static_file_warning_mb": 10,
+  "static_file_risk_mb": 20,
+  "runtime_warning_minutes": 15,
+  "history_days_initial": 60,
+  "category_order": [
+    "宽基",
+    "行业",
+    "港股",
+    "Smart Beta",
+    "海外",
+    "固收",
+    "商品",
+    "货币",
+    "未分类"
+  ],
+  "source_switches": {
+    "akshare": true,
+    "baostock": true
+  }
+}

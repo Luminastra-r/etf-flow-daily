@@ -1,0 +1,66 @@
+name: ETF 资金流向日报
+
+on:
+  schedule:
+    # 北京时间每日 07:46（= UTC 前一日 23:46），避开整点降低并发峰值
+    - cron: "46 23 * * *"
+  workflow_dispatch:
+    inputs:
+      trade_date:
+        description: "交易日 YYYY-MM-DD；留空则自动取最近已完成交易日"
+        required: false
+        type: string
+      force_refresh:
+        description: "强制重抓已有交易日"
+        required: false
+        default: false
+        type: boolean
+      rebuild_page:
+        description: "仅用现有 SQLite 重建静态页面"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write         # 需要把历史库与报告回传仓库
+
+concurrency:
+  group: etf-daily
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: 抓数 + 质量校验 + 生成报告
+        env:
+          INPUT_TRADE_DATE: ${{ inputs.trade_date }}
+          INPUT_FORCE_REFRESH: ${{ inputs.force_refresh }}
+          INPUT_REBUILD_PAGE: ${{ inputs.rebuild_page }}
+        run: |
+          args=(--scheduled-at "$(TZ=Asia/Shanghai date --iso-8601=seconds)")
+          if [ -n "$INPUT_TRADE_DATE" ]; then args+=(--trade-date "$INPUT_TRADE_DATE"); fi
+          if [ "$INPUT_FORCE_REFRESH" = "true" ]; then args+=(--force-refresh); fi
+          if [ "$INPUT_REBUILD_PAGE" = "true" ]; then args+=(--rebuild-page); fi
+          python run_daily.py "${args[@]}"
+
+      - name: 验证发布文件
+        run: python -m pytest -q
+
+      - name: 回传历史库与报告
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(data): 每日 ETF 资金流向 ${{ github.run_id }}"
+          file_pattern: "data/etf_flow.sqlite output/**"

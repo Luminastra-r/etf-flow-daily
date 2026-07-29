@@ -1,0 +1,1 @@
+{"trade_date":"2026-07-28","scheduled_at":null,"generated_at":"2026-07-29T18:02:19+08:00","status":"REBUILT","pool_label":"全量ETF池","pool_count":1511,"valid_count":1511,"missing_count":0,"coverage":1.0,"classification_version":"2026.07-v2","warnings":[],"status_counts":{"VALID":0,"PARTIAL":1511,"STALE":0,"MISSING":0}}

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>方法与质量 · ETF Flow Daily</title><link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="assets/style.css"><script defer src="assets/app.js"></script></head>
+<body data-page="methodology">
+  <header class="masthead"><a class="brand" href="index.html"><span class="brand-mark">EF</span><span>ETF FLOW / DAILY</span></a><nav><a href="index.html">资金观察</a><a href="market.html">市场环境</a><a class="active" href="methodology.html">方法与质量</a></nav></header>
+  <main>
+    <section class="page-title reveal"><p class="eyebrow">METHODOLOGY / DATA QUALITY</p><h1>每一个数字，都应当知道自己从哪里来。</h1></section>
+    <section class="method-grid reveal">
+      <article class="method-card"><span>01</span><h2>估算资金净流入</h2><code>（当日份额 − 前一有效交易日份额）× 当日单位净值 ÷ 10,000</code><p>单位为万元。它是估算值，不是交易所公布的真实资金流。QDII、港股和海外 ETF 可能存在净值日期滞后，相关记录标记 PARTIAL。</p></article>
+      <article class="method-card"><span>02</span><h2>资金流入率</h2><code>估算资金净流入 ÷ 前一交易日基金规模</code><p>前一规模由前一份额 × 前一单位净值计算。分母不可得时显示 N/A，不混用其他口径。</p></article>
+      <article class="method-card"><span>03</span><h2>数据状态</h2><p><b>VALID</b> 当日字段与资金流完整；<b>PARTIAL</b> 部分字段可用；<b>STALE</b> 页面回看最近有效值；<b>MISSING</b> 从未取得；<b>SKIPPED</b> 非交易日跳过。</p></article>
+      <article class="method-card"><span>04</span><h2>完整窗口</h2><p>5、20、60 日指标只有在拥有对应数量的有效交易日时才计算。历史不足绝不缩短窗口冒充完整周期。</p></article>
+    </section>
+    <section class="panel reveal"><div class="section-head compact"><span class="section-index">Q</span><div><p>LIVE STATUS</p><h2>当前数据质量</h2></div></div><div id="quality-live">正在加载…</div></section>
+  </main>
+  <footer><span>分类版本和覆盖率以当前构建数据为准</span></footer>
+</body>
+</html>
