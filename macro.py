@@ -69,7 +69,52 @@ def get_usdcny() -> pd.DataFrame:
 
 
 def get_dxy() -> pd.DataFrame:
-    """当前允许数据源未提供稳定 DXY 日线接口，显式降级。"""
+    """美元指数(DXY)日线。返回 date, dxy。
+
+    免 API Key：优先 Yahoo Finance 公开 chart 接口（DX-Y.NYB），
+    GitHub Actions 美国节点可直连；失败回退 AKShare 新浪美股指数。
+    """
+    # 源 1：Yahoo Finance chart 接口（无需 API Key，返回纯 JSON）
+    try:
+        import json as _json
+        import urllib.request as _urllib
+        url = ("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB"
+               "?range=1y&interval=1d")
+        req = _urllib.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _urllib.urlopen(req, timeout=20) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+        result = payload.get("chart", {}).get("result") or []
+        if result:
+            ts = result[0].get("timestamp", []) or []
+            quote = (result[0].get("indicators", {}).get("quote") or [{}])[0]
+            closes = quote.get("close", []) or []
+            rows = []
+            for i in range(len(ts)):
+                if i < len(closes) and closes[i] is not None:
+                    d = pd.Timestamp(ts[i], unit="s", tz="UTC").tz_convert(
+                        "America/New_York").normalize()
+                    rows.append((d, closes[i]))
+            if rows:
+                df = pd.DataFrame(rows, columns=["date", "dxy"])
+                df["date"] = pd.to_datetime(df["date"])
+                df["dxy"] = pd.to_numeric(df["dxy"], errors="coerce")
+                df = df.dropna(subset=["dxy"]).sort_values("date").reset_index(drop=True)
+                if not df.empty:
+                    return df[["date", "dxy"]]
+    except Exception:  # noqa: BLE001
+        pass
+    # 源 2：AKShare 新浪美股指数（备用）
+    try:
+        df = ak.index_us_stock_sina(symbol=".DXY")
+        df = _norm_date(df)
+        col = next((c for c in df.columns if "close" in str(c).lower()
+                    or "收盘" in str(c) or "price" in str(c).lower()), None)
+        if col and not df.empty:
+            out = df[["date", col]].rename(columns={col: "dxy"})
+            out["dxy"] = pd.to_numeric(out["dxy"], errors="coerce")
+            return out.dropna(subset=["dxy"])
+    except Exception:  # noqa: BLE001
+        pass
     return pd.DataFrame()
 
 
