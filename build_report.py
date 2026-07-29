@@ -152,7 +152,7 @@ def _market_payload(load_market: bool):
             series[name] = []
         else:
             series[name] = frame.tail(260).to_dict("records")
-    return {"status": "AKShare 可用字段；DXY 无稳定允许来源时显示 N/A", "series": series}
+    return {"status": "AKShare 可用字段；DXY 取自 Yahoo Finance (DX-Y.NYB)", "series": series}
 
 
 def instrument_status_counts(instruments: pd.DataFrame, all_facts: pd.DataFrame,
