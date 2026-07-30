@@ -25,6 +25,9 @@ def _seed(path):
         "pct_change": 1.0, "volume": 1, "amount": 1, "unit_nav": 4.0,
         "valuation_date": "2026-07-28", "shares": 100, "previous_aum": None,
         "estimated_net_flow": None, "flow_rate": None, "source": "AKShare",
+        "shares_raw": 100, "shares_unit": "份", "shares_unit_factor": 1.0,
+        "shares_date": "2026-07-28", "shares_source": "AKShare:SSE",
+        "shares_updated_at": stamp, "flow_status": "BASELINE",
         "data_status": "PARTIAL", "collected_at": stamp,
     }])
     db.upsert_snapshot(instrument, fact, pd.DataFrame(), path)
@@ -40,6 +43,7 @@ def test_static_build_has_external_json_and_valid_paths(tmp_path, monkeypatch):
     root = tmp_path / "build"
     assert result["total_bytes"] < 1_000_000
     assert (root / "data/overview.json").is_file()
+    assert (root / "data/daily_table.json").is_file()
     html = (root / "index.html").read_text(encoding="utf-8")
     assert "Plotly.newPlot" not in html
     assert "viewport" in html
@@ -59,7 +63,8 @@ def test_non_trading_day_is_skipped(tmp_path, monkeypatch):
 def test_workflow_has_manual_inputs_and_timeout():
     text = Path(".github/workflows/daily.yml").read_text(encoding="utf-8")
     for token in ["trade_date:", "force_refresh:", "rebuild_page:", "timeout-minutes: 20",
-                  'cron: "46 23 * * *"', "cache: \"pip\""]:
+                  'cron: "46 23 * * *"', "cache: \"pip\"", "--build-id",
+                  "etf-flow-daily.pages.dev/data/latest.json"]:
         assert token in text
 
 

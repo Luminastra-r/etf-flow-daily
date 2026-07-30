@@ -11,7 +11,8 @@ from config import PERIOD_WINDOWS, SETTINGS
 
 METRIC_COLUMNS = [
     "trade_date", "category", "window", "available_days", "estimated_net_flow",
-    "flow_rate", "price_return", "benchmark_return", "relative_return", "breadth",
+    "flow_rate", "price_return", "equal_weight_return", "benchmark_return",
+    "relative_return", "breadth",
     "inflow_count", "outflow_count", "valid_count", "missing_count",
     "top1_concentration", "top3_concentration", "inflow_streak", "flow_zscore",
     "observation_status",
@@ -59,6 +60,20 @@ def _weighted_period_return(group: pd.DataFrame):
         return None
     denom = sum(max(w, 0) for _, w in rows)
     return sum(r * max(w, 0) for r, w in rows) / denom if denom else None
+
+
+def _equal_weight_period_return(group: pd.DataFrame):
+    returns = []
+    for _, item in group.groupby("instrument_id"):
+        item = item.sort_values("trade_date")
+        closes = item.dropna(subset=["close"])
+        if len(closes) < 2:
+            values = item["pct_change"].dropna()
+            if len(group["trade_date"].unique()) == 1 and not values.empty:
+                returns.append(float(values.iloc[-1]) / 100)
+        elif closes.iloc[0]["close"]:
+            returns.append(closes.iloc[-1]["close"] / closes.iloc[0]["close"] - 1)
+    return sum(returns) / len(returns) if returns else None
 
 
 def _benchmark_return(benchmark: pd.DataFrame, dates: list[str], window: int):
@@ -114,10 +129,16 @@ def compute_metrics(current_facts: pd.DataFrame, instruments: pd.DataFrame,
                          if complete and pd.notna(flow_total) and pd.notna(denom) and denom > 0
                          else None)
             valid_count = int(flows["instrument_id"].nunique()) if complete else 0
+            category_count = int(active_counts.get(category, 0))
+            category_coverage = valid_count / category_count if category_count else 0
+            if complete and category_coverage < float(SETTINGS["coverage_failure"]):
+                flow_total = None
+                flow_rate = None
             inflow_count = int((flows["estimated_net_flow"] > 0).sum()) if complete else 0
             outflow_count = int((flows["estimated_net_flow"] < 0).sum()) if complete else 0
             breadth = inflow_count / len(flows) if complete and len(flows) else None
             price_return = _weighted_period_return(subset) if complete else None
+            equal_weight_return = _equal_weight_period_return(subset) if complete else None
             bench_return = _benchmark_return(benchmark, chosen_dates, window) if complete else None
             relative = price_return - bench_return if price_return is not None and bench_return is not None else None
 
@@ -146,6 +167,7 @@ def compute_metrics(current_facts: pd.DataFrame, instruments: pd.DataFrame,
                 "trade_date": trade_date, "category": category, "window": window,
                 "available_days": available, "estimated_net_flow": flow_total,
                 "flow_rate": flow_rate, "price_return": price_return,
+                "equal_weight_return": equal_weight_return,
                 "benchmark_return": bench_return, "relative_return": relative,
                 "breadth": breadth, "inflow_count": inflow_count if complete else None,
                 "outflow_count": outflow_count if complete else None,

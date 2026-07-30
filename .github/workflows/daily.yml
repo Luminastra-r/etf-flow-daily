@@ -42,7 +42,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: 安装依赖
-        run: pip install --no-cache-dir -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: 抓数 + 质量校验 + 生成报告
         env:
@@ -50,17 +50,44 @@ jobs:
           INPUT_FORCE_REFRESH: ${{ inputs.force_refresh }}
           INPUT_REBUILD_PAGE: ${{ inputs.rebuild_page }}
         run: |
-          args=(--scheduled-at "$(TZ=Asia/Shanghai date --iso-8601=seconds)")
+          args=(--scheduled-at "$(TZ=Asia/Shanghai date --iso-8601=seconds)" --build-id "${{ github.run_id }}")
           if [ -n "$INPUT_TRADE_DATE" ]; then args+=(--trade-date "$INPUT_TRADE_DATE"); fi
           if [ "$INPUT_FORCE_REFRESH" = "true" ]; then args+=(--force-refresh); fi
           if [ "$INPUT_REBUILD_PAGE" = "true" ]; then args+=(--rebuild-page); fi
           python run_daily.py "${args[@]}"
 
       - name: 验证发布文件
-        run: python -m pytest -q
+        run: |
+          python -m pytest -q
+          node --check web/app.js
+          node --check web/charts.js
 
       - name: 回传历史库与报告
+        id: auto_commit
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore(data): 每日 ETF 资金流向 ${{ github.run_id }}"
           file_pattern: "data/etf_flow.sqlite output/**"
+
+      - name: 核对 Cloudflare Pages 上线版本
+        if: steps.auto_commit.outputs.changes_detected == 'true'
+        env:
+          EXPECTED_BUILD_ID: ${{ github.run_id }}
+        run: |
+          local_id="$(python -c "import json; print(json.load(open('output/data/latest.json', encoding='utf-8')).get('build_id') or '')")"
+          if [ "$local_id" != "$EXPECTED_BUILD_ID" ]; then
+            echo "本次仅更新运行记录，静态页面未替换，跳过 Cloudflare 轮询。"
+            exit 0
+          fi
+          for attempt in $(seq 1 30); do
+            live_id="$(curl -fsS "https://etf-flow-daily.pages.dev/data/latest.json?run=${EXPECTED_BUILD_ID}" \
+              | python -c "import json,sys; print(json.load(sys.stdin).get('build_id') or '')" 2>/dev/null || true)"
+            if [ "$live_id" = "$EXPECTED_BUILD_ID" ]; then
+              echo "Cloudflare Pages 已上线 build_id=${EXPECTED_BUILD_ID}"
+              exit 0
+            fi
+            echo "等待 Cloudflare Pages：${attempt}/30"
+            sleep 10
+          done
+          echo "Cloudflare Pages 在 5 分钟内未出现本次 build_id" >&2
+          exit 1

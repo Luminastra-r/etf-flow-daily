@@ -1,5 +1,5 @@
 (() => {
-  const state = {period: 1, overview: null, rankings: null, industry: null, latest: null};
+  const state = {period: 1, overview: null, rankings: null, industry: null, latest: null, daily: null};
   const money = v => v == null ? "N/A" : Math.abs(v)>=10000 ? `${v>=0?"+":""}${(v/10000).toFixed(2)} 亿元` : `${v>=0?"+":""}${Math.round(v).toLocaleString()} 万元`;
   const pct = (v, digits=1) => v == null ? "N/A" : `${(v*100).toFixed(digits)}%`;
   const cls = v => v == null ? "na" : v >= 0 ? "positive" : "negative";
@@ -11,9 +11,43 @@
     el.innerHTML=`<span class="status-pill">${esc(d.status)}</span>
       <div class="status-row"><span>数据交易日</span><b>${esc(d.trade_date)}</b></div>
       <div class="status-row"><span>全量 ETF 池</span><b>${d.pool_count.toLocaleString()} 只</b></div>
-      <div class="status-row"><span>有效 / 缺失</span><b>${d.valid_count} / ${d.missing_count}</b></div>
-      <div class="status-row"><span>覆盖率</span><b class="${d.coverage<.95?"negative":"positive"}">${pct(d.coverage)}</b></div>
+      <div class="status-row"><span>资金流有效 / 缺失</span><b>${d.valid_count} / ${d.missing_count}</b></div>
+      <div class="status-row"><span>资金流 / 行情覆盖</span><b class="${d.coverage<.8?"negative":"positive"}">${pct(d.coverage)} / ${pct(d.market_coverage)}</b></div>
       <div class="status-row"><span>分类版本</span><b>${esc(d.classification_version)}</b></div>`;
+  }
+  function themeRows(items) {
+    return items.map((r,i)=>`<div class="ledger-theme-row">
+      <span class="theme-rank">${String(i+1).padStart(2,"0")}</span>
+      <b>${esc(r.theme)}</b><span>${r.flow_valid_count}/${r.etf_count}只</span>
+      <span class="${cls(r.estimated_net_flow_wan)}" title="${r.estimated_net_flow_wan==null?"不可计算":`${Number(r.estimated_net_flow_wan).toLocaleString()} 万元`}">${money(r.estimated_net_flow_wan)}</span>
+      <span class="${cls(r.equal_weight_return)}">${pct(r.equal_weight_return,2)}</span>
+    </div>`).join("");
+  }
+  function renderDailyTable() {
+    const d=state.daily, root=document.querySelector("#daily-table-root"), meta=document.querySelector("#daily-ledger-meta");
+    if(!root||!meta)return;
+    meta.classList.remove("skeleton");
+    meta.innerHTML=`<span class="flow-state ${esc(d.flow_status.toLowerCase())}">${esc(d.flow_status)}</span>
+      <b>${esc(d.trade_date)}</b><span>${d.flow_valid_count}/${d.classified_count} 只可计算 · 覆盖 ${pct(d.flow_coverage)}</span>`;
+    const categories=d.categories.map(c=>{
+      let detail;
+      if(c.ranking_mode==="full") {
+        detail=`<div class="ledger-rank-block full"><h4>完整排名</h4>${themeRows(c.full_ranking)||'<p class="na">可靠资金流不足</p>'}</div>`;
+      } else {
+        detail=`<div class="ledger-rank-block"><h4>净流入前三</h4>${themeRows(c.top_inflows)||'<p class="na">无可靠正流入主题</p>'}</div>
+          <div class="ledger-rank-block"><h4>净流出前三</h4>${themeRows(c.top_outflows)||'<p class="na">无可靠净流出主题</p>'}</div>`;
+      }
+      return `<tr class="ledger-category-row">
+        <td><span class="category-signal"></span><b>${esc(c.category)}</b><small>${esc(c.status)}</small></td>
+        <td>${c.flow_valid_count} / ${c.etf_count}</td>
+        <td class="${cls(c.estimated_net_flow_wan)}" title="${c.estimated_net_flow_wan==null?"覆盖不足或正在建立基线":`${Number(c.estimated_net_flow_wan).toLocaleString()} 万元`}">${money(c.estimated_net_flow_wan)}</td>
+        <td class="${cls(c.equal_weight_return)}">${pct(c.equal_weight_return,2)}</td>
+      </tr><tr class="ledger-detail-row"><td colspan="4"><div class="ledger-rank-grid ${c.ranking_mode}">${detail}</div></td></tr>`;
+    }).join("");
+    root.innerHTML=`<table class="daily-table"><thead><tr><th>ETF 大类</th><th>可计算 / 产品数</th><th>估算净申购</th><th>等权平均涨跌</th></tr></thead>
+      <tbody>${categories}<tr class="ledger-total-row"><td><b>已分类总计</b><small>未分类 ${d.unclassified_count} 只另行披露</small></td>
+      <td>${d.flow_valid_count} / ${d.classified_count}</td><td class="${cls(d.estimated_net_flow_wan)}">${money(d.estimated_net_flow_wan)}</td>
+      <td class="${cls(d.equal_weight_return)}">${pct(d.equal_weight_return,2)}</td></tr></tbody></table>`;
   }
   function rows() { return state.overview.by_period[String(state.period)] || []; }
   function total(field) { const xs=rows().map(r=>r[field]).filter(v=>v!=null); return xs.length ? xs.reduce((a,b)=>a+b,0) : null; }
@@ -47,13 +81,13 @@
   function renderIndustry() {
     const body=document.querySelector("#industry-table tbody"); if(!body)return;
     const data=state.industry.filter(r=>r.window===state.period).sort((a,b)=>(b.estimated_net_flow??-Infinity)-(a.estimated_net_flow??-Infinity));
-    body.innerHTML=data.length?data.map(r=>`<tr><td><b>${esc(r.secondary_category)}</b></td><td class="${cls(r.estimated_net_flow)}">${money(r.estimated_net_flow)}</td><td>${pct(r.flow_rate,2)}</td><td>${pct(r.breadth)}</td><td class="${cls(r.price_return)}">${r.price_return==null?"N/A":`${Number(r.price_return).toFixed(2)}%`}</td><td>${r.etf_count}</td><td>${(r.representatives||[]).map(esc).join(" · ")||"N/A"}</td></tr>`).join(""):`<tr><td colspan="7" class="na">完整 ${state.period} 日历史不足</td></tr>`;
+    body.innerHTML=data.length?data.map(r=>`<tr><td><b>${esc(r.secondary_category)}</b></td><td class="${cls(r.estimated_net_flow)}">${money(r.estimated_net_flow)}</td><td>${pct(r.flow_rate,2)}</td><td>${pct(r.breadth)}</td><td class="${cls(r.price_return)}">${pct(r.price_return,2)}</td><td>${r.etf_count}</td><td>${(r.representatives||[]).map(esc).join(" · ")||"N/A"}</td></tr>`).join(""):`<tr><td colspan="7" class="na">完整 ${state.period} 日历史不足</td></tr>`;
   }
   function renderRankings() {
     const root=document.querySelector("#ranking-grid"); if(!root)return;
     const groups=state.rankings[String(state.period)]||[];
     root.innerHTML=groups.length?groups.map(g=>`<article class="rank-category"><div class="rank-title"><h3>${esc(g.category)}</h3><span class="rank-status">${esc(g.status)}</span></div>
-      <div class="rank-lists ${g.mode}">${g.lists.map(list=>`<div class="rank-list"><h4>${esc(list.title)}</h4>${list.items.map((r,i)=>`<div class="table-scroll"><div class="rank-item"><span class="rank-no">${String(i+1).padStart(2,"0")}</span><b>${esc(r.secondary_category)}</b><span>${r.etf_count}只</span><span class="${cls(r.estimated_net_flow)}">${money(r.estimated_net_flow)}</span><span>${r.price_return==null?"N/A":Number(r.price_return).toFixed(2)+"%"}</span></div></div>`).join("")||`<p class="na">历史不足</p>`}</div>`).join("")}</div></article>`).join(""):`<div class="panel na">完整 ${state.period} 日历史不足，暂无排名。</div>`;
+      <div class="rank-lists ${g.mode}">${g.lists.map(list=>`<div class="rank-list"><h4>${esc(list.title)}</h4>${list.items.map((r,i)=>`<div class="table-scroll"><div class="rank-item"><span class="rank-no">${String(i+1).padStart(2,"0")}</span><b>${esc(r.secondary_category)}</b><span>${r.etf_count}只</span><span class="${cls(r.estimated_net_flow)}">${money(r.estimated_net_flow)}</span><span>${pct(r.price_return,2)}</span></div></div>`).join("")||`<p class="na">历史不足</p>`}</div>`).join("")}</div></article>`).join(""):`<div class="panel na">完整 ${state.period} 日历史不足，暂无排名。</div>`;
   }
   function renderDashboard() {
     renderPeriods();renderKpis();renderBrief();renderIndustry();renderRankings();
@@ -61,16 +95,18 @@
     FlowCharts.quadrant(document.querySelector("#quadrant-chart"),rows());
   }
   async function dashboard() {
-    [state.latest,state.overview,state.rankings,state.industry]=await Promise.all([
-      get("data/latest.json"),get("data/overview.json"),get("data/category_latest.json"),get("data/industry_latest.json")
+    [state.latest,state.daily,state.overview,state.rankings,state.industry]=await Promise.all([
+      get("data/latest.json"),get("data/daily_table.json"),get("data/overview.json"),get("data/category_latest.json"),get("data/industry_latest.json")
     ]);
-    state.period=state.overview.default_period;renderStatus();renderDashboard();
+    state.period=state.overview.default_period;renderStatus();renderDailyTable();renderDashboard();
   }
   async function market() {
     const data=await get("data/market_context.json");document.querySelector("#market-status").textContent=data.status;
-    const definitions=[["index","close","沪深300"],["valuation","pe_ttm","沪深300 PE-TTM"],["usdcny","usdcny","美元兑离岸人民币"],["bond","spread","中美十年期利差"],["margin","margin","融资余额"],["dxy","dxy","美元指数"]];
     const root=document.querySelector("#market-grid");
-    definitions.forEach(([key,field,label])=>{const card=document.createElement("article");card.className="market-card";root.appendChild(card);FlowCharts.line(card,data.series[key]||[],field,label);});
+    if(!data.series?.length){root.innerHTML='<article class="panel na">当前没有通过健康检查的市场辅助字段。</article>';return;}
+    data.series.forEach(item=>{const card=document.createElement("article");card.className="market-card";card.dataset.state=item.state;
+      card.insertAdjacentHTML("beforeend",`<div class="market-meta"><span>${esc(item.source)}</span><b>${esc(item.state)}</b><time>${esc(item.as_of||"N/A")}</time></div><div class="market-chart"></div>`);
+      root.appendChild(card);FlowCharts.line(card.querySelector(".market-chart"),item.data||[],item.field,item.label);});
   }
   async function methodology() {
     const d=await get("data/latest.json"), el=document.querySelector("#quality-live");

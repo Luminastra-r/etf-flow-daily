@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,6 +20,14 @@ from config import (
 from presentation import ranking_layout
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+DISPLAY_CATEGORIES = ["宽基", "行业", "港股", "Smart Beta", "海外", "固收", "商品", "货币"]
+MARKET_DEFINITIONS = {
+    "index": {"field": "close", "label": "沪深300", "source": "AKShare"},
+    "valuation": {"field": "pe_ttm", "label": "沪深300 PE-TTM", "source": "AKShare"},
+    "bond": {"field": "spread", "label": "中美十年期利差", "source": "AKShare"},
+    "margin": {"field": "margin", "label": "融资余额", "source": "AKShare"},
+    "dxy": {"field": "dxy", "label": "美元指数", "source": "Yahoo Finance / AKShare"},
+}
 
 
 def _clean(value):
@@ -92,7 +101,7 @@ def _rankings(all_facts: pd.DataFrame, window: int) -> list[dict]:
                    estimated_net_flow=("estimated_net_flow",
                                        lambda s: s.sum(min_count=1)),
                    flow_rate=("flow_rate", "mean"),
-                   price_return=("pct_change", "mean"),
+                   price_return=("pct_change", lambda s: s.mean() / 100),
                ).reset_index())
     output = []
     for category, part in grouped.groupby("primary_category"):
@@ -114,7 +123,7 @@ def _industry_matrix(all_facts: pd.DataFrame) -> list[dict]:
         grouped = industry.groupby("secondary_category").agg(
             estimated_net_flow=("estimated_net_flow", lambda s: s.sum(min_count=1)),
             flow_rate=("flow_rate", "mean"),
-            price_return=("pct_change", "mean"),
+            price_return=("pct_change", lambda s: s.mean() / 100),
             inflow_count=("estimated_net_flow", lambda s: int((s > 0).sum())),
             valid_count=("estimated_net_flow", lambda s: int(s.notna().sum())),
             etf_count=("instrument_id", "nunique"),
@@ -142,17 +151,220 @@ def _industry_matrix(all_facts: pd.DataFrame) -> list[dict]:
     return output
 
 
+def _previous_market_payload() -> dict:
+    payloads = []
+    path = OUTPUT_DIR / "data" / "market_context.json"
+    if path.is_file():
+        try:
+            payloads.append(json.loads(path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            pass
+    # v2 -> v3 首次发布时，从当前远端基线继承已经验证过的市场序列。
+    try:
+        result = subprocess.run(
+            ["git", "show", "origin/main:output/data/market_context.json"],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        )
+        payloads.append(json.loads(result.stdout))
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        pass
+    converted = {}
+    for payload in payloads:
+        raw = payload.get("series", [])
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and item.get("key"):
+                    converted.setdefault(item["key"], item)
+            continue
+        if isinstance(raw, dict):
+            for key, rows in raw.items():
+                if key not in MARKET_DEFINITIONS or not rows or key in converted:
+                    continue
+                definition = MARKET_DEFINITIONS[key]
+                last_date = rows[-1].get("date")
+                converted[key] = {
+                    "key": key, **definition, "state": "VALID",
+                    "as_of": str(last_date)[:10] if last_date else None,
+                    "data": rows,
+                }
+    return converted
+
+
 def _market_payload(load_market: bool):
     if not load_market:
-        return {"status": "测试模式", "series": {}}
+        return {"status": "测试模式", "series": []}
     loaded = macro.load_all()
-    series = {}
-    for name, frame in loaded.items():
-        if frame is None or frame.empty:
-            series[name] = []
+    previous = _previous_market_payload()
+    health_rows = db.source_health()
+    health_map = (
+        health_rows.set_index("field_key").to_dict("index")
+        if not health_rows.empty else {}
+    )
+    series = []
+    for name, definition in MARKET_DEFINITIONS.items():
+        frame = loaded.get(name, pd.DataFrame())
+        if frame is not None and not frame.empty:
+            value_date = pd.to_datetime(frame["date"], errors="coerce").max()
+            value_date_text = None if pd.isna(value_date) else value_date.date().isoformat()
+            health = db.record_source_health(
+                name, definition["source"], True, value_date=value_date_text,
+                details={"rows": len(frame)},
+            )
+            series.append({
+                "key": name, **definition, "state": "VALID",
+                "as_of": value_date_text, "data": frame.tail(260).to_dict("records"),
+                "health": health,
+            })
+            continue
+        health = db.record_source_health(
+            name, definition["source"], False, error="本次构建未取得有效记录",
+        )
+        cached = previous.get(name)
+        old_health = health_map.get(name, {})
+        if cached and not old_health.get("last_success_at"):
+            db.record_source_health(
+                name, definition["source"], True,
+                value_date=cached.get("as_of"), details={"bootstrap": "v2 static output"},
+            )
+            health = db.record_source_health(
+                name, definition["source"], False, error="本次构建未取得有效记录",
+            )
+        if health["active"] and cached and cached.get("data"):
+            series.append({
+                **cached, **definition, "state": "STALE", "health": health,
+            })
+    return {
+        "status": "仅展示健康字段；临时失败标记 STALE，连续失败字段自动下线",
+        "series": series,
+    }
+
+
+def _daily_table(trade_date: str, instruments: pd.DataFrame,
+                 facts: pd.DataFrame, generated_at: str) -> dict:
+    joined = instruments[[
+        "instrument_id", "primary_category", "secondary_category",
+    ]].merge(
+        facts[[
+            "instrument_id", "estimated_net_flow", "pct_change", "flow_status",
+        ]],
+        on="instrument_id", how="left",
+    )
+    classified = joined[joined["primary_category"].isin(DISPLAY_CATEGORIES)].copy()
+    valid = classified[
+        classified["flow_status"].eq("VALID")
+        & classified["estimated_net_flow"].notna()
+    ]
+    total_count = len(classified)
+    total_valid = len(valid)
+    total_coverage = total_valid / total_count if total_count else 0
+    total_flow = (
+        valid["estimated_net_flow"].sum(min_count=1)
+        if total_coverage >= float(SETTINGS["coverage_failure"]) else None
+    )
+    equal_return = (
+        classified["pct_change"].dropna().mean() / 100
+        if classified["pct_change"].notna().any() else None
+    )
+
+    categories = []
+    for category in DISPLAY_CATEGORIES:
+        group = classified[classified["primary_category"] == category]
+        count = len(group)
+        if not count:
+            continue
+        group_valid = group[
+            group["flow_status"].eq("VALID")
+            & group["estimated_net_flow"].notna()
+        ]
+        valid_count = len(group_valid)
+        coverage = valid_count / count
+        category_flow = (
+            group_valid["estimated_net_flow"].sum(min_count=1)
+            if coverage >= float(SETTINGS["coverage_failure"]) else None
+        )
+        category_return = (
+            group["pct_change"].dropna().mean() / 100
+            if group["pct_change"].notna().any() else None
+        )
+        themes = []
+        themed = group[group["secondary_category"] != "未分类"]
+        for theme, part in themed.groupby("secondary_category"):
+            theme_valid = part[
+                part["flow_status"].eq("VALID")
+                & part["estimated_net_flow"].notna()
+            ]
+            theme_coverage = len(theme_valid) / len(part)
+            themes.append({
+                "theme": theme,
+                "etf_count": len(part),
+                "flow_valid_count": len(theme_valid),
+                "flow_coverage": theme_coverage,
+                "estimated_net_flow_wan": (
+                    theme_valid["estimated_net_flow"].sum(min_count=1)
+                    if theme_coverage >= float(SETTINGS["coverage_failure"]) else None
+                ),
+                "equal_weight_return": (
+                    part["pct_change"].dropna().mean() / 100
+                    if part["pct_change"].notna().any() else None
+                ),
+            })
+        ranked = [item for item in themes if item["estimated_net_flow_wan"] is not None]
+        ranked.sort(key=lambda item: (-item["estimated_net_flow_wan"], item["theme"]))
+        if len(themes) < 6:
+            mode = "full"
+            full_ranking = ranked
+            top_inflows, top_outflows = [], []
         else:
-            series[name] = frame.tail(260).to_dict("records")
-    return {"status": "AKShare 可用字段；DXY 取自 Yahoo Finance (DX-Y.NYB)", "series": series}
+            mode = "split"
+            full_ranking = []
+            top_inflows = [item for item in ranked if item["estimated_net_flow_wan"] > 0][:3]
+            selected = {item["theme"] for item in top_inflows}
+            top_outflows = sorted(
+                [
+                    item for item in ranked
+                    if item["estimated_net_flow_wan"] < 0 and item["theme"] not in selected
+                ],
+                key=lambda item: (item["estimated_net_flow_wan"], item["theme"]),
+            )[:3]
+        if valid_count == 0 and group["flow_status"].eq("BASELINE").any():
+            status = "BASELINE"
+        elif coverage >= float(SETTINGS["coverage_warning"]):
+            status = "VALID"
+        else:
+            status = "PARTIAL"
+        categories.append({
+            "category": category,
+            "etf_count": count,
+            "flow_valid_count": valid_count,
+            "flow_coverage": coverage,
+            "estimated_net_flow_wan": category_flow,
+            "equal_weight_return": category_return,
+            "status": status,
+            "ranking_mode": mode,
+            "full_ranking": full_ranking,
+            "top_inflows": top_inflows,
+            "top_outflows": top_outflows,
+        })
+    flow_status = (
+        "VALID" if total_coverage >= float(SETTINGS["coverage_failure"])
+        else "BASELINE" if classified["flow_status"].eq("BASELINE").any()
+        else "PARTIAL"
+    )
+    return {
+        "trade_date": trade_date,
+        "generated_at": generated_at,
+        "flow_status": flow_status,
+        "total_etf_count": len(instruments),
+        "classified_count": total_count,
+        "unclassified_count": int(
+            (instruments["primary_category"] == "未分类").sum()
+        ),
+        "flow_valid_count": total_valid,
+        "flow_coverage": total_coverage,
+        "estimated_net_flow_wan": total_flow,
+        "equal_weight_return": equal_return,
+        "categories": categories,
+    }
 
 
 def instrument_status_counts(instruments: pd.DataFrame, all_facts: pd.DataFrame,
@@ -177,6 +389,7 @@ def _validate_build(root: Path):
         "assets/app.js", "assets/charts.js", "data/latest.json",
         "data/overview.json", "data/category_latest.json",
         "data/industry_latest.json", "data/market_context.json",
+        "data/daily_table.json",
     ]
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
@@ -207,7 +420,8 @@ def _publish(root: Path):
 
 
 def build(trade_date: str | None = None, load_market: bool = True,
-          publish: bool = True, status_override: dict | None = None) -> dict:
+          publish: bool = True, status_override: dict | None = None,
+          build_id: str | None = None) -> dict:
     db.migrate()
     trade_date = trade_date or db.get_latest_date()
     if not trade_date:
@@ -221,8 +435,17 @@ def build(trade_date: str | None = None, load_market: bool = True,
     facts = all_facts[all_facts["trade_date"] == trade_date].copy()
     cat_metrics = _category_metrics(trade_date, facts, instruments)
     pool_count = len(instruments)
-    valid_count = int(facts[["close", "shares", "unit_nav"]].notna().all(axis=1).sum())
+    market_valid_count = int(
+        facts[["close", "shares", "unit_nav"]].notna().all(axis=1).sum()
+    )
+    valid_count = int(
+        (
+            facts["flow_status"].eq("VALID")
+            & facts["estimated_net_flow"].notna()
+        ).sum()
+    )
     coverage = valid_count / pool_count if pool_count else 0
+    market_coverage = market_valid_count / pool_count if pool_count else 0
     status = status_override or _latest_status(trade_date, pool_count, valid_count)
 
     if BUILD_DIR.exists():
@@ -238,7 +461,10 @@ def build(trade_date: str | None = None, load_market: bool = True,
         "generated_at": status["generated_at"], "status": status["status"],
         "pool_label": "全量ETF池", "pool_count": pool_count,
         "valid_count": valid_count, "missing_count": pool_count - valid_count,
-        "coverage": coverage, "classification_version": CLASSIFICATION_VERSION,
+        "coverage": coverage, "market_valid_count": market_valid_count,
+        "market_coverage": market_coverage,
+        "classification_version": CLASSIFICATION_VERSION,
+        "build_id": build_id,
         "warnings": status["warnings"],
         "status_counts": instrument_status_counts(instruments, all_facts, trade_date),
     }
@@ -252,6 +478,9 @@ def build(trade_date: str | None = None, load_market: bool = True,
     }
     rankings = {str(w): _rankings(all_facts, w) for w in PERIOD_WINDOWS}
     industry = _industry_matrix(all_facts)
+    daily_table = _daily_table(
+        trade_date, instruments, facts, status["generated_at"],
+    )
     history = (cat_metrics[cat_metrics["window"] == 1]
                .sort_values("trade_date").to_dict("records"))
 
@@ -259,6 +488,7 @@ def build(trade_date: str | None = None, load_market: bool = True,
     _write_json(BUILD_DIR / "data/overview.json", overview)
     _write_json(BUILD_DIR / "data/category_latest.json", rankings)
     _write_json(BUILD_DIR / "data/industry_latest.json", industry)
+    _write_json(BUILD_DIR / "data/daily_table.json", daily_table)
     _write_json(BUILD_DIR / "data/market_context.json", _market_payload(load_market))
     year = trade_date[:4]
     _write_json(BUILD_DIR / f"data/history/category_{year}.json", history)

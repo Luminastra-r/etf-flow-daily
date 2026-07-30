@@ -17,17 +17,28 @@
     <nav><a class="active" href="index.html">资金观察</a><a href="market.html">市场环境</a><a href="methodology.html">方法与质量</a></nav>
   </header>
   <main>
-    <section class="hero reveal">
+    <section class="hero daily-hero reveal">
       <div>
-        <p class="eyebrow">全量 ETF 池 · 每日 07:46 CST</p>
-        <h1>资金流不是答案，<br><em>它是市场留下的笔迹。</em></h1>
-        <p class="lede">观察估算资金净流入、价格与广度的共同变化。所有结论均由规则生成，不构成投资建议。</p>
+        <p class="eyebrow">PRE-MARKET CAPITAL TAPE · 07:46 CST</p>
+        <h1>大类 ETF<br><em>资金流向日报</em></h1>
+        <p class="lede">以前一完整交易日的可靠份额快照估算净申购。缺失就是缺失，不用零值修饰未知。</p>
       </div>
       <aside class="status-panel" id="status-panel"><span class="skeleton">正在读取数据状态…</span></aside>
     </section>
 
+    <section class="daily-ledger reveal">
+      <div class="ledger-head">
+        <div><p class="eyebrow">DAILY FLOW LEDGER</p><h2>前一交易日资金流主表</h2></div>
+        <div id="daily-ledger-meta" class="ledger-meta skeleton">正在核对份额基线…</div>
+      </div>
+      <div id="daily-table-root" class="table-scroll">
+        <div class="ledger-loading skeleton">正在生成大类与细分主题排名…</div>
+      </div>
+      <p class="ledger-note">估算净申购 =（当日份额 − 上一有效交易日份额）× 当日单位净值；金额单位按数值自动切换。未分类 ETF 不进入主表合计。</p>
+    </section>
+
     <section class="period-bar reveal">
-      <div><span class="section-index">01</span><h2>观察周期</h2></div>
+      <div><span class="section-index">01</span><h2>扩展观察周期</h2></div>
       <div class="period-switch" id="period-switch" aria-label="周期选择"></div>
     </section>
 

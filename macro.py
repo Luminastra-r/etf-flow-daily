@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""宏观辅助数据：基准指数、宽基估值分位、人民币+美元指数、中美利差、融资融券。
+"""宏观辅助数据：基准指数、估值、美元指数、中美利差与融资融券。
 
 数据源均已实测可用（akshare 1.18.x）。全部带容错，某一路失败返回空表，不影响整体报告。
 统一返回以 date 为列的 DataFrame（升序）。
@@ -48,21 +48,6 @@ def get_valuation(symbol: str = "沪深300") -> pd.DataFrame:
             out = df[["date", col]].rename(columns={col: "pe_ttm"})
             out["pe_ttm"] = pd.to_numeric(out["pe_ttm"], errors="coerce")
             return out.dropna(subset=["pe_ttm"])
-    except Exception:  # noqa: BLE001
-        pass
-    return pd.DataFrame()
-
-
-def get_usdcny() -> pd.DataFrame:
-    """美元兑离岸人民币。返回 date, usdcny。"""
-    try:
-        df = ak.forex_hist_em(symbol="USDCNH")
-        df = _norm_date(df)
-        col = next((c for c in df.columns if "最新价" in str(c) or "收盘" in str(c)), None)
-        if col and not df.empty:
-            out = df[["date", col]].rename(columns={col: "usdcny"})
-            out["usdcny"] = pd.to_numeric(out["usdcny"], errors="coerce")
-            return out.dropna(subset=["usdcny"])
     except Exception:  # noqa: BLE001
         pass
     return pd.DataFrame()
@@ -156,7 +141,6 @@ def load_all(index_symbol="sh000300") -> dict:
     return {
         "index": get_index_hist(index_symbol),
         "valuation": get_valuation(),
-        "usdcny": get_usdcny(),
         "dxy": get_dxy(),
         "bond": get_bond(),
         "margin": get_margin(),

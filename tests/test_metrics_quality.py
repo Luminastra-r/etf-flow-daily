@@ -23,6 +23,9 @@ def _facts(days=1):
                 "pct_change": 1.0, "volume": 1, "amount": 1, "unit_nav": 4.0,
                 "valuation_date": day, "shares": 100, "previous_aum": 400,
                 "estimated_net_flow": 10 if j == 0 else -5, "flow_rate": .025 if j == 0 else -.0125,
+                "shares_raw": 100, "shares_unit": "份", "shares_unit_factor": 1.0,
+                "shares_date": day, "shares_source": "AKShare:SSE",
+                "shares_updated_at": db.now_cn(), "flow_status": "VALID",
                 "source": "AKShare", "data_status": "VALID", "collected_at": db.now_cn(),
             })
     return pd.DataFrame(rows)
@@ -53,10 +56,10 @@ def test_quality_distinguishes_zero_and_missing(tmp_path):
     )
     facts = _facts(1)
     facts["estimated_net_flow"] = [0.0, None]
-    issues, stats = validate_snapshot(instruments, facts, "2026-07-20", path)
-    assert stats["coverage"] == 1
+    facts["flow_status"] = ["VALID", "SOURCE_MISSING"]
+    with pytest.raises(QualityGateError):
+        validate_snapshot(instruments, facts, "2026-07-20", path)
     assert facts["estimated_net_flow"].iloc[0] == 0
     assert pd.isna(facts["estimated_net_flow"].iloc[1])
     with pytest.raises(QualityGateError):
         validate_snapshot(instruments, facts.iloc[0:0], "2026-07-20", path)
-

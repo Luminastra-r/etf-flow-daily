@@ -56,15 +56,16 @@ AKShare / Baostock
 覆盖率低于 95% 产生警告，低于 80% 阻止正式写入和发布。空 staging、日期错配、重复主键、
 非法负值等错误同样阻止发布，上一版正常页面不会被覆盖。
 
-## SQLite v2
+## SQLite v3
 
 - `etf_instrument`：ETF 主数据，主键形如 `SH.510300`。
 - `etf_daily_fact`：每日事实，唯一键 `(trade_date, instrument_id)`。
 - `category_daily_metric`：1/5/20/60 日分类指标。
 - `pipeline_run`、`quality_issue`：运行状态和质量问题。
+- `source_field_health`：非核心字段连续失败、陈旧和自动下线状态。
 - `schema_migrations`：幂等迁移记录。
 
-旧 `etf_daily`、`category_daily` 和 `meta` 表保留为只读历史。首次 v2 迁移前会在
+旧 `etf_daily`、`category_daily` 和 `meta` 表保留为只读历史。首次 v3 迁移前会在
 `data/backups/` 创建一次本地备份，该目录不会提交到 Git。
 
 ## 静态输出
@@ -80,6 +81,7 @@ output/
 │  └─ style.css
 └─ data/
    ├─ latest.json
+   ├─ daily_table.json
    ├─ overview.json
    ├─ category_latest.json
    ├─ industry_latest.json

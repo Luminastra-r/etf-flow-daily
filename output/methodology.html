@@ -8,7 +8,7 @@
     <section class="method-grid reveal">
       <article class="method-card"><span>01</span><h2>估算资金净流入</h2><code>（当日份额 − 前一有效交易日份额）× 当日单位净值 ÷ 10,000</code><p>单位为万元。它是估算值，不是交易所公布的真实资金流。QDII、港股和海外 ETF 可能存在净值日期滞后，相关记录标记 PARTIAL。</p></article>
       <article class="method-card"><span>02</span><h2>资金流入率</h2><code>估算资金净流入 ÷ 前一交易日基金规模</code><p>前一规模由前一份额 × 前一单位净值计算。分母不可得时显示 N/A，不混用其他口径。</p></article>
-      <article class="method-card"><span>03</span><h2>数据状态</h2><p><b>VALID</b> 当日字段与资金流完整；<b>PARTIAL</b> 部分字段可用；<b>STALE</b> 页面回看最近有效值；<b>MISSING</b> 从未取得；<b>SKIPPED</b> 非交易日跳过。</p></article>
+      <article class="method-card"><span>03</span><h2>数据状态</h2><p><b>VALID</b> 份额日期和资金流完整；<b>BASELINE</b> 首次可靠份额快照，仅建基线；<b>DATE_MISMATCH</b> 日期无法对齐；<b>SOURCE_MISSING</b> 份额源缺失；<b>ANOMALOUS</b> 全市场静止等异常。只有 VALID 进入资金排名。</p></article>
       <article class="method-card"><span>04</span><h2>完整窗口</h2><p>5、20、60 日指标只有在拥有对应数量的有效交易日时才计算。历史不足绝不缩短窗口冒充完整周期。</p></article>
     </section>
     <section class="panel reveal"><div class="section-head compact"><span class="section-index">Q</span><div><p>LIVE STATUS</p><h2>当前数据质量</h2></div></div><div id="quality-live">正在加载…</div></section>

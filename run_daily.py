@@ -20,6 +20,7 @@ def _parser():
     parser.add_argument("--force-refresh", action="store_true", help="强制重抓已有交易日")
     parser.add_argument("--rebuild-page", action="store_true", help="仅使用现有 SQLite 重建页面")
     parser.add_argument("--scheduled-at", help="计划运行时间（北京时间 ISO8601）")
+    parser.add_argument("--build-id", help="GitHub Actions run_id / 构建标识")
     parser.add_argument("--no-market", action="store_true", help="构建时不抓宏观数据（测试用）")
     return parser
 
@@ -45,10 +46,23 @@ def execute(args) -> dict:
             raise RuntimeError("无历史数据可重建")
         db.start_run(run_id, expected, args.scheduled_at)
         try:
+            flow_state = db.query(
+                """SELECT
+                     SUM(CASE WHEN flow_status='VALID' THEN 1 ELSE 0 END) valid_n,
+                     SUM(CASE WHEN flow_status='BASELINE' THEN 1 ELSE 0 END) baseline_n
+                   FROM etf_daily_fact WHERE trade_date=?""", (expected,)
+            ).iloc[0]
+            page_status = (
+                "BASELINE"
+                if int(flow_state["valid_n"] or 0) == 0
+                and int(flow_state["baseline_n"] or 0) > 0
+                else "REBUILT"
+            )
             build = build_report.build(
                 expected, load_market=not args.no_market,
-                status_override={"status": "REBUILT", "scheduled_at": args.scheduled_at,
+                status_override={"status": page_status, "scheduled_at": args.scheduled_at,
                                  "generated_at": db.now_cn(), "warnings": []},
+                build_id=getattr(args, "build_id", None),
             )
             db.finish_run(run_id, "REBUILT", expected, coverage=build["coverage"])
             db.checkpoint()
@@ -69,7 +83,7 @@ def execute(args) -> dict:
         if not args.force_refresh:
             existing = db.query(
                 """SELECT COUNT(*) n FROM etf_daily_fact
-                   WHERE trade_date=? AND data_status='VALID'""", (expected,)
+                   WHERE trade_date=? AND flow_status='VALID'""", (expected,)
             )
             if int(existing.iloc[0]["n"]):
                 build = build_report.build(
@@ -77,6 +91,7 @@ def execute(args) -> dict:
                     status_override={"status": "REBUILT", "scheduled_at": args.scheduled_at,
                                      "generated_at": db.now_cn(),
                                      "warnings": ["当日有效数据已存在，仅重建页面"]},
+                    build_id=getattr(args, "build_id", None),
                 )
                 db.finish_run(run_id, "REBUILT", expected, warnings=["当日有效数据已存在，仅重建页面"])
                 db.checkpoint()
@@ -87,19 +102,23 @@ def execute(args) -> dict:
         result = fetch.compute_and_store(
             expected, run_id, benchmark=benchmark, force_refresh=args.force_refresh
         )
-        warnings = benchmark_warnings + [
+        warnings = benchmark_warnings + result.get("source_warnings", []) + [
             f"{x['check_name']}: {x.get('details', {})}"
             for x in result["issues"] if x["severity"] == "WARNING"
         ]
-        facts = result["facts"]
-        status = "VALID" if (facts["data_status"] == "VALID").all() else "PARTIAL"
+        status = "BASELINE" if result.get("baseline") else (
+            "VALID" if result["coverage"] >= float(SETTINGS["coverage_warning"])
+            else "PARTIAL"
+        )
         build = build_report.build(
             expected, load_market=not args.no_market,
             status_override={"status": status, "scheduled_at": args.scheduled_at,
                              "generated_at": db.now_cn(), "warnings": warnings},
+            build_id=getattr(args, "build_id", None),
         )
+        database_status = "PARTIAL" if status == "BASELINE" else status
         db.finish_run(
-            run_id, status, expected, result["pool_count"], result["valid_count"],
+            run_id, database_status, expected, result["pool_count"], result["valid_count"],
             result["coverage"], warnings=warnings,
         )
         db.checkpoint()

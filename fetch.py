@@ -1,13 +1,14 @@
-"""AKShare 全量 ETF staging、标准化、估算资金流与事务入库。"""
+"""ETF staging：交易所份额优先、日期对齐、估算资金流与事务入库。"""
 from __future__ import annotations
 
-import json
 import re
 import time
+from datetime import date
 
 import akshare as ak
 import pandas as pd
 
+import calendar_service
 import db
 import metrics
 import quality
@@ -32,6 +33,15 @@ def _retry(fn, label=""):
     raise RuntimeError(f"{label} 连续失败: {last}")
 
 
+def _optional(fn, label: str, warnings: list[str]) -> pd.DataFrame:
+    try:
+        value = _retry(fn, label)
+        return value.copy() if value is not None else pd.DataFrame()
+    except Exception as exc:
+        warnings.append(f"{label} 不可用: {exc}")
+        return pd.DataFrame()
+
+
 def _nav_cols(frame: pd.DataFrame):
     found = []
     for col in frame.columns:
@@ -41,31 +51,33 @@ def _nav_cols(frame: pd.DataFrame):
     return sorted(found, reverse=True)
 
 
-def fetch_staging() -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    spot = _retry(ak.fund_etf_spot_em, "fund_etf_spot_em").copy()
-    spot = spot.rename(columns={
-        "代码": "code", "名称": "spot_name", "最新份额": "shares",
-        "涨跌幅": "pct_change", "最新价": "close", "成交量": "volume",
-        "成交额": "amount",
-    })
-    required = {"code", "spot_name"}
-    if not required.issubset(spot.columns):
-        raise RuntimeError(f"ETF 快照缺列: {sorted(required - set(spot.columns))}")
-    for col in ["shares", "pct_change", "close", "volume", "amount"]:
-        spot[col] = _to_num(spot[col]) if col in spot else pd.NA
-    spot["code"] = spot["code"].map(normalize_code)
-    spot = spot.drop_duplicates("code", keep="first")
+def _safe_code(value):
+    try:
+        return normalize_code(value)
+    except ValueError:
+        return None
 
-    daily = _retry(ak.fund_etf_fund_daily_em, "fund_etf_fund_daily_em").copy()
-    nav_cols = _nav_cols(daily)
+
+def _date_text(value):
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _prepare_daily(raw: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    nav_cols = _nav_cols(raw)
     if not nav_cols:
         raise RuntimeError("ETF 净值表未找到日期化单位净值列")
     trade_date = nav_cols[0][0]
-    daily = daily.rename(columns={
+    daily = raw.rename(columns={
         "基金代码": "code", "基金简称": "daily_name", "市价": "nav_market",
         "类型": "fund_type",
-    })
-    daily["code"] = daily["code"].map(normalize_code)
+    }).copy()
+    if not {"code", "daily_name"}.issubset(daily.columns):
+        raise RuntimeError("ETF 净值表缺少基金代码或基金简称")
+    daily["code"] = daily["code"].map(_safe_code)
+    daily = daily.dropna(subset=["code"])
     nav = pd.Series(pd.NA, index=daily.index, dtype="Float64")
     valuation_date = pd.Series(pd.NA, index=daily.index, dtype="string")
     for date_text, col in nav_cols:
@@ -75,19 +87,204 @@ def fetch_staging() -> tuple[pd.DataFrame, pd.DataFrame, str]:
         valuation_date.loc[use] = date_text
     daily["unit_nav"] = nav
     daily["valuation_date"] = valuation_date
-    keep = ["code", "daily_name", "fund_type", "unit_nav", "valuation_date"]
-    daily = daily[keep].drop_duplicates("code", keep="first")
+    daily["nav_market"] = _to_num(daily.get("nav_market"))
+    keep = ["code", "daily_name", "fund_type", "unit_nav", "valuation_date", "nav_market"]
+    return daily[keep].drop_duplicates("code", keep="first"), trade_date
 
-    stage = spot.merge(daily, on="code", how="left")
-    stage["name"] = stage["daily_name"].fillna(stage["spot_name"])
-    stage["fund_type"] = stage["fund_type"].fillna("未知")
+
+def _prepare_spot(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame(columns=[
+            "code", "spot_name", "close", "pct_change", "volume", "amount",
+            "spot_shares_raw", "spot_shares_date", "spot_updated_at",
+        ])
+    spot = raw.rename(columns={
+        "代码": "code", "名称": "spot_name", "最新份额": "spot_shares_raw",
+        "涨跌幅": "pct_change", "最新价": "close", "成交量": "volume",
+        "成交额": "amount", "数据日期": "spot_shares_date",
+        "更新时间": "spot_updated_at",
+    }).copy()
+    required = {"code", "spot_name"}
+    if not required.issubset(spot.columns):
+        raise RuntimeError(f"ETF 快照缺列: {sorted(required - set(spot.columns))}")
+    spot["code"] = spot["code"].map(_safe_code)
+    spot = spot.dropna(subset=["code"])
+    for col in ["spot_shares_raw", "pct_change", "close", "volume", "amount"]:
+        spot[col] = _to_num(spot[col]) if col in spot else pd.NA
+    if "spot_shares_date" not in spot:
+        spot["spot_shares_date"] = None
+    spot["spot_shares_date"] = spot["spot_shares_date"].map(_date_text)
+    if "spot_updated_at" not in spot:
+        spot["spot_updated_at"] = None
+    spot["spot_updated_at"] = spot["spot_updated_at"].map(
+        lambda x: None if pd.isna(x) else str(x)
+    )
+    keep = [
+        "code", "spot_name", "close", "pct_change", "volume", "amount",
+        "spot_shares_raw", "spot_shares_date", "spot_updated_at",
+    ]
+    return spot[keep].drop_duplicates("code", keep="first")
+
+
+def _prepare_sse(raw: pd.DataFrame, expected_date: str) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    shares = raw.rename(columns={
+        "基金代码": "code", "基金简称": "exchange_name", "基金份额": "exchange_shares_raw",
+        "统计日期": "exchange_shares_date",
+    }).copy()
+    required = {"code", "exchange_shares_raw", "exchange_shares_date"}
+    if not required.issubset(shares.columns):
+        raise RuntimeError(f"上交所份额缺列: {sorted(required - set(shares.columns))}")
+    shares["code"] = shares["code"].map(_safe_code)
+    shares = shares.dropna(subset=["code"])
+    shares["exchange_shares_raw"] = _to_num(shares["exchange_shares_raw"])
+    shares["exchange_shares_date"] = shares["exchange_shares_date"].map(_date_text)
+    shares["exchange_shares_source"] = "AKShare:SSE"
+    shares["exchange_shares_unit"] = "份"
+    shares["exchange_shares_factor"] = 1.0
+    shares["exchange_updated_at"] = db.now_cn()
+    # 接口允许按历史日期请求；返回日期仍必须与请求日完全一致。
+    shares.loc[shares["exchange_shares_date"] != expected_date, "exchange_shares_raw"] = pd.NA
+    return shares[[
+        "code", "exchange_name", "exchange_shares_raw", "exchange_shares_date",
+        "exchange_shares_source", "exchange_shares_unit", "exchange_shares_factor",
+        "exchange_updated_at",
+    ]].drop_duplicates("code", keep="first")
+
+
+def _prepare_szse(raw: pd.DataFrame, expected_date: str,
+                  latest_completed: str) -> pd.DataFrame:
+    if raw.empty or expected_date != latest_completed:
+        return pd.DataFrame()
+    shares = raw.rename(columns={
+        "基金代码": "code", "基金简称": "exchange_name", "基金份额": "exchange_shares_raw",
+        "基金类别": "exchange_fund_category",
+    }).copy()
+    required = {"code", "exchange_shares_raw"}
+    if not required.issubset(shares.columns):
+        raise RuntimeError(f"深交所份额缺列: {sorted(required - set(shares.columns))}")
+    if "exchange_fund_category" in shares:
+        shares = shares[
+            shares["exchange_fund_category"].astype(str).str.contains("ETF", case=False, na=False)
+        ]
+    shares["code"] = shares["code"].map(_safe_code)
+    shares = shares.dropna(subset=["code"])
+    shares["exchange_shares_raw"] = _to_num(shares["exchange_shares_raw"])
+    shares["exchange_shares_date"] = expected_date
+    shares["exchange_shares_source"] = "AKShare:SZSE"
+    shares["exchange_shares_unit"] = "份"
+    shares["exchange_shares_factor"] = 1.0
+    shares["exchange_updated_at"] = db.now_cn()
+    if "exchange_name" not in shares:
+        shares["exchange_name"] = None
+    return shares[[
+        "code", "exchange_name", "exchange_shares_raw", "exchange_shares_date",
+        "exchange_shares_source", "exchange_shares_unit", "exchange_shares_factor",
+        "exchange_updated_at",
+    ]].drop_duplicates("code", keep="first")
+
+
+def _combine_exchange(sse: pd.DataFrame, szse: pd.DataFrame) -> pd.DataFrame:
+    available = [frame for frame in [sse, szse] if frame is not None and not frame.empty]
+    if not available:
+        return pd.DataFrame()
+    return pd.concat(available, ignore_index=True).drop_duplicates("code", keep="first")
+
+
+def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, str, list[str]]:
+    db.migrate(create_backup=False)
+    warnings: list[str] = []
+    daily_raw = _retry(ak.fund_etf_fund_daily_em, "fund_etf_fund_daily_em")
+    daily, trade_date = _prepare_daily(daily_raw)
+    expected_date = expected_date or trade_date
+    if trade_date != expected_date:
+        raise RuntimeError(f"净值日期 {trade_date} 与请求交易日 {expected_date} 不一致")
+
+    spot = _prepare_spot(_optional(ak.fund_etf_spot_em, "fund_etf_spot_em", warnings))
+    sse_fn = getattr(ak, "fund_etf_scale_sse", None)
+    szse_fn = getattr(ak, "fund_etf_scale_szse", None)
+    if sse_fn is None or szse_fn is None:
+        raise RuntimeError("AKShare 版本不包含交易所 ETF 份额接口，请安装 1.18.81")
+    sse = _prepare_sse(
+        _optional(lambda: sse_fn(date=expected_date.replace("-", "")),
+                  "fund_etf_scale_sse", warnings),
+        expected_date,
+    )
+    latest_completed = calendar_service.latest_completed_trade_date()
+    szse = _prepare_szse(
+        _optional(szse_fn, "fund_etf_scale_szse", warnings),
+        expected_date,
+        latest_completed,
+    )
+    exchange = _combine_exchange(sse, szse)
+
+    stage = daily.merge(spot, on="code", how="outer")
+    if not exchange.empty:
+        stage = stage.merge(exchange, on="code", how="outer")
+    else:
+        for col in [
+            "exchange_name", "exchange_shares_raw", "exchange_shares_date",
+            "exchange_shares_source", "exchange_shares_unit",
+            "exchange_shares_factor", "exchange_updated_at",
+        ]:
+            stage[col] = pd.NA
+    stage["code"] = stage["code"].map(_safe_code)
+    stage = stage.dropna(subset=["code"]).drop_duplicates("code", keep="first")
     stage["exchange"] = stage["code"].map(infer_exchange)
+    stage["name"] = (
+        stage.get("daily_name").fillna(stage.get("spot_name"))
+        .fillna(stage.get("exchange_name")).fillna(stage["code"])
+    )
+    stage["fund_type"] = stage.get("fund_type").fillna("未知")
+    spot_market_valid = stage["spot_shares_date"] == expected_date
+    stage["close"] = (
+        _to_num(stage.get("close")).where(spot_market_valid)
+        .fillna(_to_num(stage.get("nav_market")))
+    )
+    for col in ["pct_change", "volume", "amount"]:
+        stage[col] = _to_num(stage.get(col)).where(spot_market_valid)
+    stage["unit_nav"] = _to_num(stage.get("unit_nav"))
+
+    exchange_valid = (
+        stage["exchange_shares_raw"].notna()
+        & (stage["exchange_shares_date"] == expected_date)
+    )
+    spot_valid = (
+        stage["spot_shares_raw"].notna()
+        & (stage["spot_shares_date"] == expected_date)
+    )
+    stage["shares_raw"] = stage["exchange_shares_raw"].where(
+        exchange_valid, stage["spot_shares_raw"]
+    )
+    stage["shares_unit"] = stage["exchange_shares_unit"].where(exchange_valid, "份")
+    stage["shares_unit_factor"] = stage["exchange_shares_factor"].where(exchange_valid, 1.0)
+    stage["shares_date"] = stage["exchange_shares_date"].where(
+        exchange_valid, stage["spot_shares_date"]
+    )
+    stage["shares_source"] = stage["exchange_shares_source"].where(
+        exchange_valid, "AKShare:EM"
+    )
+    stage["shares_updated_at"] = stage["exchange_updated_at"].where(
+        exchange_valid, stage["spot_updated_at"]
+    )
+    stage["shares"] = (
+        stage["shares_raw"] * stage["shares_unit_factor"]
+    ).where(exchange_valid | spot_valid)
+
+    comparable = exchange_valid & spot_valid & stage["spot_shares_raw"].notna()
+    denominator = stage["exchange_shares_raw"].where(stage["exchange_shares_raw"] > 0)
+    stage["share_source_deviation"] = (
+        (stage["exchange_shares_raw"] - stage["spot_shares_raw"]).abs() / denominator
+    ).where(comparable)
+
     stage["instrument_id"] = stage.apply(
-        lambda r: instrument_id(r["code"], r["exchange"]), axis=1
+        lambda row: instrument_id(row["code"], row["exchange"]), axis=1
     )
     stage = classify_frame(stage, name_col="name", type_col="fund_type")
-    stage = stage.rename(columns={"category": "primary_category",
-                                  "sub_industry": "secondary_category"})
+    stage = stage.rename(columns={
+        "category": "primary_category", "sub_industry": "secondary_category",
+    })
 
     stamp = db.now_cn()
     instruments = pd.DataFrame({
@@ -111,53 +308,87 @@ def fetch_staging() -> tuple[pd.DataFrame, pd.DataFrame, str]:
         "updated_at": stamp,
     })
 
-    facts = stage[[
+    fact_columns = [
         "instrument_id", "close", "pct_change", "volume", "amount", "unit_nav",
-        "valuation_date", "shares",
-    ]].copy()
+        "valuation_date", "shares", "shares_raw", "shares_unit",
+        "shares_unit_factor", "shares_date", "shares_source", "shares_updated_at",
+        "share_source_deviation",
+    ]
+    facts = stage[fact_columns].copy()
     facts.insert(0, "trade_date", trade_date)
     previous = db.query(
-        """SELECT f.instrument_id,f.shares,f.unit_nav FROM etf_daily_fact f
-           JOIN (SELECT instrument_id,MAX(trade_date) d FROM etf_daily_fact
-                 WHERE trade_date<? GROUP BY instrument_id) p
-             ON p.instrument_id=f.instrument_id AND p.d=f.trade_date""",
+        """SELECT f.instrument_id,f.shares,f.unit_nav,f.trade_date
+           FROM etf_daily_fact f
+           JOIN (
+               SELECT instrument_id,MAX(trade_date) d
+               FROM etf_daily_fact
+               WHERE trade_date<? AND shares IS NOT NULL AND shares_date=trade_date
+               GROUP BY instrument_id
+           ) p ON p.instrument_id=f.instrument_id AND p.d=f.trade_date""",
+        (trade_date,),
+    ).rename(columns={
+        "shares": "prev_shares", "unit_nav": "prev_nav",
+        "trade_date": "prev_trade_date",
+    })
+    facts = facts.merge(previous, on="instrument_id", how="left")
+    previous_close = db.query(
+        """SELECT f.instrument_id,f.close prev_close
+           FROM etf_daily_fact f
+           JOIN (
+               SELECT instrument_id,MAX(trade_date) d
+               FROM etf_daily_fact
+               WHERE trade_date<? AND close IS NOT NULL
+               GROUP BY instrument_id
+           ) p ON p.instrument_id=f.instrument_id AND p.d=f.trade_date""",
         (trade_date,),
     )
-    previous = previous.rename(columns={"shares": "prev_shares", "unit_nav": "prev_nav"})
-    facts = facts.merge(previous, on="instrument_id", how="left")
-    facts["previous_aum"] = facts["prev_shares"] * facts["prev_nav"] * SHARE_TO_YUAN
+    facts = facts.merge(previous_close, on="instrument_id", how="left")
+    for col in ["prev_close", "prev_shares", "prev_nav"]:
+        facts[col] = _to_num(facts[col])
+    computed_change = (facts["close"] / facts["prev_close"] - 1) * 100
+    facts["pct_change"] = facts["pct_change"].fillna(computed_change)
+
+    current_share = facts["shares"].notna() & (facts["shares_date"] == trade_date)
+    previous_share = facts["prev_shares"].notna() & facts["prev_trade_date"].notna()
+    current_nav = facts["unit_nav"].notna() & (facts["valuation_date"] == trade_date)
+    facts["previous_aum"] = (
+        facts["prev_shares"] * facts["prev_nav"] * SHARE_TO_YUAN
+    ).where(previous_share & facts["prev_nav"].notna() & (facts["prev_nav"] > 0))
+    ready = current_share & previous_share & current_nav & (facts["previous_aum"] > 0)
     facts["estimated_net_flow"] = (
         (facts["shares"] - facts["prev_shares"]) * facts["unit_nav"]
         * SHARE_TO_YUAN / RESULT_UNIT
-    )
+    ).where(ready)
     facts["flow_rate"] = (
-        facts["estimated_net_flow"] * RESULT_UNIT
-        / facts["previous_aum"].where(facts["previous_aum"] > 0)
-    )
-    full = facts[["close", "shares", "unit_nav"]].notna().all(axis=1)
-    current_nav = facts["valuation_date"] == trade_date
-    flow_ready = facts["estimated_net_flow"].notna()
-    facts["data_status"] = (full & current_nav & flow_ready).map(
-        {True: "VALID", False: "PARTIAL"}
-    )
+        facts["estimated_net_flow"] * RESULT_UNIT / facts["previous_aum"]
+    ).where(ready)
+    facts["flow_status"] = "SOURCE_MISSING"
+    facts.loc[facts["shares"].notna() & ~current_share, "flow_status"] = "DATE_MISMATCH"
+    facts.loc[current_share & ~previous_share, "flow_status"] = "BASELINE"
+    facts.loc[current_share & previous_share & ~current_nav, "flow_status"] = "DATE_MISMATCH"
+    facts.loc[ready, "flow_status"] = "VALID"
+    facts["data_status"] = (
+        ready & facts["close"].notna()
+    ).map({True: "VALID", False: "PARTIAL"})
     facts["source"] = "AKShare"
     facts["collected_at"] = stamp
-    facts = facts.drop(columns=["prev_shares", "prev_nav"])
-    return instruments, facts, trade_date
+    facts = facts.drop(columns=["prev_shares", "prev_nav", "prev_close", "prev_trade_date"])
+    return instruments, facts, trade_date, warnings
 
 
 def compute_and_store(expected_date: str, run_id: str, benchmark=None,
                       force_refresh: bool = False) -> dict:
-    instruments, facts, data_date = fetch_staging()
+    instruments, facts, data_date, source_warnings = fetch_staging(expected_date)
     if data_date != expected_date:
         raise RuntimeError(f"数据日期 {data_date} 与请求交易日 {expected_date} 不一致")
     issues, stats = quality.validate_snapshot(instruments, facts, expected_date)
     category_metrics = metrics.compute_metrics(
         facts, instruments, expected_date, benchmark=benchmark
     )
+    quality.validate_metrics(facts, instruments, category_metrics, expected_date)
     db.upsert_snapshot(instruments, facts, category_metrics)
     db.record_quality_issues(run_id, issues)
     return {
         "instruments": instruments, "facts": facts, "metrics": category_metrics,
-        "issues": issues, **stats,
+        "issues": issues, "source_warnings": source_warnings, **stats,
     }

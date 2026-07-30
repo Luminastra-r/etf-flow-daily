@@ -1,5 +1,5 @@
-akshare>=1.14.0
-baostock>=0.8.9
+akshare==1.18.81
+baostock==0.9.3
 pandas>=2.0.0
 plotly>=5.20.0
 pytest>=8.0.0

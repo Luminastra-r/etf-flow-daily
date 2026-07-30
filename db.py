@@ -1,4 +1,4 @@
-"""SQLite v2：版本化迁移、事务 UPSERT 与查询辅助。"""
+"""SQLite v3：版本化迁移、可追溯份额、来源健康与事务 UPSERT。"""
 from __future__ import annotations
 
 import json
@@ -10,11 +10,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from config import BACKUP_DIR, CLASSIFICATION_VERSION, DB_PATH
+from config import BACKUP_DIR, CLASSIFICATION_VERSION, DB_PATH, SETTINGS
 from instrument import infer_exchange, instrument_id, normalize_code
 
-SCHEMA_VERSION = "2"
-SCHEMA_CHECKSUM = "etf-flow-v2-20260729"
+SCHEMA_VERSION = "3"
+SCHEMA_CHECKSUM = "etf-flow-v3-share-audit-20260730"
 
 DDL_V2 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -53,9 +53,17 @@ CREATE TABLE IF NOT EXISTS etf_daily_fact (
     unit_nav REAL,
     valuation_date TEXT,
     shares REAL,
+    shares_raw REAL,
+    shares_unit TEXT,
+    shares_unit_factor REAL,
+    shares_date TEXT,
+    shares_source TEXT,
+    shares_updated_at TEXT,
     previous_aum REAL,
     estimated_net_flow REAL,
     flow_rate REAL,
+    flow_status TEXT NOT NULL DEFAULT 'BASELINE'
+        CHECK(flow_status IN ('VALID','BASELINE','DATE_MISMATCH','SOURCE_MISSING','ANOMALOUS')),
     source TEXT NOT NULL,
     data_status TEXT NOT NULL CHECK(data_status IN ('VALID','PARTIAL')),
     collected_at TEXT NOT NULL,
@@ -69,6 +77,7 @@ CREATE TABLE IF NOT EXISTS category_daily_metric (
     estimated_net_flow REAL,
     flow_rate REAL,
     price_return REAL,
+    equal_weight_return REAL,
     benchmark_return REAL,
     relative_return REAL,
     breadth REAL,
@@ -104,6 +113,17 @@ CREATE TABLE IF NOT EXISTS quality_issue (
     severity TEXT NOT NULL CHECK(severity IN ('WARNING','ERROR')),
     affected_count INTEGER NOT NULL DEFAULT 0,
     details_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS source_field_health (
+    field_key TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    last_success_at TEXT,
+    last_value_date TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    error_message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fact_instrument_date
     ON etf_daily_fact(instrument_id, trade_date);
@@ -146,7 +166,7 @@ def _backup_once(path: Path) -> Path | None:
     if not path.exists():
         return None
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    target = BACKUP_DIR / f"{path.stem}.pre_v2.sqlite"
+    target = BACKUP_DIR / f"{path.stem}.pre_v3.sqlite"
     if target.exists():
         return target
     src = sqlite3.connect(str(path))
@@ -157,6 +177,64 @@ def _backup_once(path: Path) -> Path | None:
         dst.close()
         src.close()
     return target
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str):
+    if name not in _columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _apply_v3(conn: sqlite3.Connection):
+    """为现有 v2 表补列，并只失效已证明污染的派生值。"""
+    fact_columns = {
+        "shares_raw": "REAL",
+        "shares_unit": "TEXT",
+        "shares_unit_factor": "REAL",
+        "shares_date": "TEXT",
+        "shares_source": "TEXT",
+        "shares_updated_at": "TEXT",
+        "flow_status": "TEXT NOT NULL DEFAULT 'BASELINE'",
+    }
+    for name, ddl in fact_columns.items():
+        _ensure_column(conn, "etf_daily_fact", name, ddl)
+    _ensure_column(conn, "category_daily_metric", "equal_weight_return", "REAL")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS source_field_health (
+            field_key TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            last_success_at TEXT,
+            last_value_date TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            error_message TEXT,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    # 2026-07-28 与 2026-07-29 的份额均在 7 月 29 日采集，不能构成跨日差分。
+    polluted = conn.execute(
+        """SELECT COUNT(*) FROM etf_daily_fact
+           WHERE trade_date='2026-07-29' AND estimated_net_flow=0"""
+    ).fetchone()[0]
+    if polluted:
+        conn.execute(
+            """UPDATE etf_daily_fact
+               SET previous_aum=NULL,estimated_net_flow=NULL,flow_rate=NULL,
+                   flow_status='BASELINE',data_status='PARTIAL'
+               WHERE trade_date='2026-07-29'"""
+        )
+        conn.execute(
+            "DELETE FROM category_daily_metric WHERE trade_date='2026-07-29'"
+        )
+    conn.execute(
+        """UPDATE etf_daily_fact
+           SET flow_status='BASELINE'
+           WHERE flow_status IS NULL OR shares_date IS NULL"""
+    )
 
 
 def migrate(path: str | Path | None = None, create_backup: bool = True) -> dict:
@@ -173,6 +251,7 @@ def migrate(path: str | Path | None = None, create_backup: bool = True) -> dict:
     migrated_facts = 0
     with connect(db_path) as conn:
         conn.executescript(DDL_V2)
+        _apply_v3(conn)
         if conn.execute(
             "SELECT 1 FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
         ).fetchone():
@@ -211,11 +290,14 @@ def migrate(path: str | Path | None = None, create_backup: bool = True) -> dict:
                 conn.execute(
                     """INSERT OR IGNORE INTO etf_daily_fact(
                         trade_date,instrument_id,close,pct_change,unit_nav,valuation_date,
-                        shares,previous_aum,estimated_net_flow,flow_rate,source,data_status,collected_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        shares,shares_raw,shares_unit,shares_unit_factor,shares_date,
+                        previous_aum,estimated_net_flow,flow_rate,flow_status,
+                        source,data_status,collected_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (row["date"], iid, row["close"], row["change_pct"], row["nav"],
-                     row["date"], row["shares"], previous_aum, row["net_subscribe"],
-                     flow_rate, "AKShare", status, stamp),
+                     row["date"], row["shares"], row["shares"], "未知", None, None,
+                     previous_aum, row["net_subscribe"], flow_rate, "BASELINE",
+                     "AKShare", status, stamp),
                 )
                 migrated_facts += 1
 
@@ -310,6 +392,59 @@ def record_quality_issues(run_id: str, issues: list[dict], path=None):
         )
 
 
+def record_source_health(field_key: str, source: str, success: bool,
+                         value_date: str | None = None, error: str | None = None,
+                         details: dict | None = None, path=None) -> dict:
+    """记录非核心字段健康度；从未成功或连续三次失败时停用。"""
+    migrate(path, create_backup=False)
+    with connect(path) as conn:
+        old = conn.execute(
+            "SELECT * FROM source_field_health WHERE field_key=?", (field_key,)
+        ).fetchone()
+        if success:
+            failures = 0
+        else:
+            previous_failures = int(old["consecutive_failures"] if old else 0)
+            previous_update_date = str(old["updated_at"] or "")[:10] if old else ""
+            today = now_cn()[:10]
+            # 同一北京时间日期内的重建和重试只算一次失败，避免把一次
+            # 计划运行误判为连续三次计划运行失败并提前从 UI 下线。
+            same_run_day_failure = (
+                previous_update_date == today
+                and previous_failures > 0
+            )
+            failures = previous_failures if same_run_day_failure else previous_failures + 1
+        last_success = now_cn() if success else (old["last_success_at"] if old else None)
+        last_date = value_date if success else (old["last_value_date"] if old else None)
+        active = 1 if success else int(
+            bool(last_success) and failures < int(SETTINGS["field_retire_failures"])
+        )
+        conn.execute(
+            """INSERT INTO source_field_health(
+                field_key,source,last_success_at,last_value_date,consecutive_failures,
+                active,error_message,details_json,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(field_key) DO UPDATE SET
+                source=excluded.source,last_success_at=excluded.last_success_at,
+                last_value_date=excluded.last_value_date,
+                consecutive_failures=excluded.consecutive_failures,active=excluded.active,
+                error_message=excluded.error_message,details_json=excluded.details_json,
+                updated_at=excluded.updated_at""",
+            (field_key, source, last_success, last_date, failures, active, error,
+             json.dumps(details or {}, ensure_ascii=False), now_cn()),
+        )
+        return {
+            "field_key": field_key, "source": source, "last_success_at": last_success,
+            "last_value_date": last_date, "consecutive_failures": failures,
+            "active": bool(active), "error_message": error,
+        }
+
+
+def source_health(path=None) -> pd.DataFrame:
+    migrate(path, create_backup=False)
+    return query("SELECT * FROM source_field_health ORDER BY field_key", path=path)
+
+
 def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.DataFrame,
                     path: str | Path | None = None):
     """一个事务写入全部正式表；新空值不会覆盖已有有效字段。"""
@@ -347,14 +482,26 @@ def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.
 
         for row in facts.to_dict("records"):
             clean = {k: (None if pd.isna(v) else v) for k, v in row.items()}
+            clean.setdefault("shares_raw", clean.get("shares"))
+            clean.setdefault("shares_unit", "份" if clean.get("shares") is not None else None)
+            clean.setdefault("shares_unit_factor", 1.0 if clean.get("shares") is not None else None)
+            clean.setdefault("shares_date", None)
+            clean.setdefault("shares_source", clean.get("source"))
+            clean.setdefault("shares_updated_at", clean.get("collected_at"))
+            clean.setdefault(
+                "flow_status",
+                "VALID" if clean.get("estimated_net_flow") is not None else "BASELINE",
+            )
             conn.execute(
                 """INSERT INTO etf_daily_fact(
                     trade_date,instrument_id,close,pct_change,volume,amount,unit_nav,
-                    valuation_date,shares,previous_aum,estimated_net_flow,flow_rate,
-                    source,data_status,collected_at
+                    valuation_date,shares,shares_raw,shares_unit,shares_unit_factor,
+                    shares_date,shares_source,shares_updated_at,previous_aum,
+                    estimated_net_flow,flow_rate,flow_status,source,data_status,collected_at
                 ) VALUES(:trade_date,:instrument_id,:close,:pct_change,:volume,:amount,:unit_nav,
-                    :valuation_date,:shares,:previous_aum,:estimated_net_flow,:flow_rate,
-                    :source,:data_status,:collected_at)
+                    :valuation_date,:shares,:shares_raw,:shares_unit,:shares_unit_factor,
+                    :shares_date,:shares_source,:shares_updated_at,:previous_aum,
+                    :estimated_net_flow,:flow_rate,:flow_status,:source,:data_status,:collected_at)
                 ON CONFLICT(trade_date,instrument_id) DO UPDATE SET
                     close=COALESCE(excluded.close,etf_daily_fact.close),
                     pct_change=COALESCE(excluded.pct_change,etf_daily_fact.pct_change),
@@ -362,10 +509,22 @@ def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.
                     amount=COALESCE(excluded.amount,etf_daily_fact.amount),
                     unit_nav=COALESCE(excluded.unit_nav,etf_daily_fact.unit_nav),
                     valuation_date=COALESCE(excluded.valuation_date,etf_daily_fact.valuation_date),
-                    shares=COALESCE(excluded.shares,etf_daily_fact.shares),
+                    shares=CASE
+                        WHEN excluded.shares_date=excluded.trade_date THEN excluded.shares
+                        WHEN etf_daily_fact.shares_date=etf_daily_fact.trade_date
+                            THEN etf_daily_fact.shares
+                        ELSE NULL
+                    END,
+                    shares_raw=COALESCE(excluded.shares_raw,etf_daily_fact.shares_raw),
+                    shares_unit=COALESCE(excluded.shares_unit,etf_daily_fact.shares_unit),
+                    shares_unit_factor=COALESCE(excluded.shares_unit_factor,etf_daily_fact.shares_unit_factor),
+                    shares_date=COALESCE(excluded.shares_date,etf_daily_fact.shares_date),
+                    shares_source=COALESCE(excluded.shares_source,etf_daily_fact.shares_source),
+                    shares_updated_at=COALESCE(excluded.shares_updated_at,etf_daily_fact.shares_updated_at),
                     previous_aum=COALESCE(excluded.previous_aum,etf_daily_fact.previous_aum),
                     estimated_net_flow=COALESCE(excluded.estimated_net_flow,etf_daily_fact.estimated_net_flow),
                     flow_rate=COALESCE(excluded.flow_rate,etf_daily_fact.flow_rate),
+                    flow_status=excluded.flow_status,
                     source=excluded.source,
                     data_status=CASE WHEN etf_daily_fact.data_status='VALID'
                                       AND excluded.data_status='PARTIAL'
