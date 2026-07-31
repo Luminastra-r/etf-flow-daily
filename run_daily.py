@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 import uuid
 from datetime import date, timedelta
@@ -39,6 +40,13 @@ def execute(args) -> dict:
     migration = db.migrate()
     run_id = uuid.uuid4().hex
     expected = args.trade_date
+    # 容错：用户可能在 workflow_dispatch 输入了 "trade_date: 2026-07-30" 等带前缀格式
+    if expected:
+        match = re.search(r"\d{4}-\d{2}-\d{2}", expected)
+        if match:
+            expected = match.group()
+        else:
+            raise RuntimeError(f"无法从输入中解析交易日: {expected}")
 
     if args.rebuild_page:
         expected = expected or db.get_latest_date()
