@@ -217,6 +217,12 @@ def _fund_etf_scale_szse_fixed() -> pd.DataFrame:
     temp_df = pd.read_excel(io.BytesIO(r.content), engine="openpyxl", dtype={"基金代码": str})
     if "当前规模(份)" in temp_df.columns:
         temp_df.rename(columns={"当前规模(份)": "基金份额"}, inplace=True)
+    # 与 akshare 原版一致：清理千位分隔符并转数值
+    if "基金份额" in temp_df.columns:
+        temp_df["基金份额"] = (
+            temp_df["基金份额"].astype(str).str.replace(",", "", regex=False)
+        )
+        temp_df["基金份额"] = pd.to_numeric(temp_df["基金份额"], errors="coerce")
     keep = ["基金代码", "基金简称", "基金类别", "基金份额"]
     keep = [c for c in keep if c in temp_df.columns]
     return temp_df[keep]
