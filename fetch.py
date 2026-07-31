@@ -1,12 +1,14 @@
 """ETF staging：交易所份额优先、日期对齐、估算资金流与事务入库。"""
 from __future__ import annotations
 
+import io
 import re
 import time
 from datetime import date
 
 import akshare as ak
 import pandas as pd
+import requests
 
 import calendar_service
 import db
@@ -192,6 +194,34 @@ def _prepare_szse(raw: pd.DataFrame, expected_date: str,
     ]].drop_duplicates("code", keep="first")
 
 
+def _fund_etf_scale_szse_fixed() -> pd.DataFrame:
+    """修复 akshare fund_etf_scale_szse 的 bytes 返回值 bug。
+
+    akshare 1.18.81 直接将 requests.get().content（bytes）传给 pd.read_excel，
+    在 pandas 2.x + openpyxl 环境下报错。这里用 io.BytesIO 包装。
+    """
+    url = "https://fund.szse.cn/api/report/ShowReport"
+    params = {
+        "SHOWTYPE": "xlsx",
+        "CATALOGID": "1000_lf",
+        "TABKEY": "tab1",
+        "random": "0.07610353191740105",
+    }
+    headers = {
+        "Referer": "https://fund.szse.cn/marketdata/fundslist/index.html",
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36"),
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    temp_df = pd.read_excel(io.BytesIO(r.content), engine="openpyxl", dtype={"基金代码": str})
+    if "当前规模(份)" in temp_df.columns:
+        temp_df.rename(columns={"当前规模(份)": "基金份额"}, inplace=True)
+    keep = ["基金代码", "基金简称", "基金类别", "基金份额"]
+    keep = [c for c in keep if c in temp_df.columns]
+    return temp_df[keep]
+
+
 def _combine_exchange(sse: pd.DataFrame, szse: pd.DataFrame) -> pd.DataFrame:
     available = [frame for frame in [sse, szse] if frame is not None and not frame.empty]
     if not available:
@@ -210,17 +240,27 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
 
     spot = _prepare_spot(_optional(ak.fund_etf_spot_em, "fund_etf_spot_em", warnings))
     sse_fn = getattr(ak, "fund_etf_scale_sse", None)
-    szse_fn = getattr(ak, "fund_etf_scale_szse", None)
-    if sse_fn is None or szse_fn is None:
-        raise RuntimeError("AKShare 版本不包含交易所 ETF 份额接口，请安装 1.18.81")
+    if sse_fn is None:
+        raise RuntimeError("AKShare 版本不包含上交所 ETF 份额接口，请安装 1.18.81")
     sse = _prepare_sse(
         _optional(lambda: sse_fn(date=expected_date.replace("-", "")),
                   "fund_etf_scale_sse", warnings),
         expected_date,
     )
     latest_completed = calendar_service.latest_completed_trade_date()
+    # 先尝试 akshare 原始接口，失败（bytes bug）时用修复版
+    szse_fn = getattr(ak, "fund_etf_scale_szse", None)
+
+    def _szse_with_fallback():
+        if szse_fn:
+            try:
+                return szse_fn()
+            except Exception:
+                pass
+        return _fund_etf_scale_szse_fixed()
+
     szse = _prepare_szse(
-        _optional(szse_fn, "fund_etf_scale_szse", warnings),
+        _optional(_szse_with_fallback, "fund_etf_scale_szse", warnings),
         expected_date,
         latest_completed,
     )
