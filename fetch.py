@@ -388,6 +388,19 @@ def compute_and_store(expected_date: str, run_id: str, benchmark=None,
     instruments, facts, data_date, source_warnings = fetch_staging(expected_date)
     if data_date != expected_date:
         raise RuntimeError(f"数据日期 {data_date} 与请求交易日 {expected_date} 不一致")
+    # 诊断输出：帮助定位覆盖率不足的具体原因
+    n = len(facts)
+    if n:
+        shares_date_dist = facts["shares_date"].value_counts(dropna=False).to_dict()
+        shares_source_dist = facts["shares_source"].value_counts(dropna=False).to_dict()
+        close_valid = int(facts["close"].notna().sum())
+        shares_valid = int(facts["shares"].notna().sum())
+        unit_nav_valid = int(facts["unit_nav"].notna().sum())
+        print(f"[fetch] pool={n} close={close_valid} shares={shares_valid} unit_nav={unit_nav_valid}")
+        print(f"[fetch] shares_date={shares_date_dist}")
+        print(f"[fetch] shares_source={shares_source_dist}")
+    if source_warnings:
+        print(f"[fetch] source_warnings={source_warnings}")
     issues, stats = quality.validate_snapshot(instruments, facts, expected_date)
     category_metrics = metrics.compute_metrics(
         facts, instruments, expected_date, benchmark=benchmark
