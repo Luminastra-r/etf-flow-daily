@@ -65,11 +65,18 @@ def _date_text(value):
     return parsed.strftime("%Y-%m-%d")
 
 
-def _prepare_daily(raw: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+def _prepare_daily(raw: pd.DataFrame, expected_date: str | None = None) -> tuple[pd.DataFrame, str]:
     nav_cols = _nav_cols(raw)
     if not nav_cols:
         raise RuntimeError("ETF 净值表未找到日期化单位净值列")
-    trade_date = nav_cols[0][0]
+    all_dates = [d for d, _ in nav_cols]
+    # 优先使用请求交易日对应的净值列，避免数据已更新到更新日期时日期不匹配
+    if expected_date and expected_date in all_dates:
+        trade_date = expected_date
+        nav_cols = [(d, c) for d, c in nav_cols if d == expected_date] + \
+                   [(d, c) for d, c in nav_cols if d != expected_date]
+    else:
+        trade_date = all_dates[0]
     daily = raw.rename(columns={
         "基金代码": "code", "基金简称": "daily_name", "市价": "nav_market",
         "类型": "fund_type",
@@ -196,7 +203,7 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
     db.migrate(create_backup=False)
     warnings: list[str] = []
     daily_raw = _retry(ak.fund_etf_fund_daily_em, "fund_etf_fund_daily_em")
-    daily, trade_date = _prepare_daily(daily_raw)
+    daily, trade_date = _prepare_daily(daily_raw, expected_date)
     expected_date = expected_date or trade_date
     if trade_date != expected_date:
         raise RuntimeError(f"净值日期 {trade_date} 与请求交易日 {expected_date} 不一致")
