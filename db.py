@@ -1,4 +1,4 @@
-"""SQLite v3：版本化迁移、可追溯份额、来源健康与事务 UPSERT。"""
+"""SQLite v4：版本化迁移、可追溯份额、来源健康与异常修复。"""
 from __future__ import annotations
 
 import json
@@ -13,8 +13,8 @@ import pandas as pd
 from config import BACKUP_DIR, CLASSIFICATION_VERSION, DB_PATH, SETTINGS
 from instrument import infer_exchange, instrument_id, normalize_code
 
-SCHEMA_VERSION = "3"
-SCHEMA_CHECKSUM = "etf-flow-v3-share-audit-20260730"
+SCHEMA_VERSION = "4"
+SCHEMA_CHECKSUM = "etf-flow-v4-price-date-corporate-action-20260804"
 
 DDL_V2 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -166,7 +166,7 @@ def _backup_once(path: Path) -> Path | None:
     if not path.exists():
         return None
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    target = BACKUP_DIR / f"{path.stem}.pre_v3.sqlite"
+    target = BACKUP_DIR / f"{path.stem}.pre_v4.sqlite"
     if target.exists():
         return target
     src = sqlite3.connect(str(path))
@@ -215,6 +215,51 @@ def _apply_v3(conn: sqlite3.Connection):
             updated_at TEXT NOT NULL
         )"""
     )
+
+
+def _apply_v4(conn: sqlite3.Connection):
+    """清理无法代表目标交易日的零涨跌，并隔离明显的拆分/份额折算。"""
+    dates = conn.execute(
+        """SELECT trade_date,COUNT(pct_change) AS n,
+                  SUM(CASE WHEN ABS(pct_change)<1e-12 THEN 1 ELSE 0 END) AS zeros
+           FROM etf_daily_fact GROUP BY trade_date HAVING n>=100"""
+    ).fetchall()
+    polluted_dates = [row["trade_date"] for row in dates if row["zeros"] / row["n"] >= 0.95]
+    for trade_date in polluted_dates:
+        conn.execute("UPDATE etf_daily_fact SET pct_change=NULL WHERE trade_date=?", (trade_date,))
+        conn.execute("DELETE FROM category_daily_metric WHERE trade_date=?", (trade_date,))
+
+    rows = conn.execute(
+        """SELECT trade_date,instrument_id,shares,unit_nav,shares_date
+           FROM etf_daily_fact
+           WHERE shares IS NOT NULL AND unit_nav IS NOT NULL
+           ORDER BY instrument_id,trade_date"""
+    ).fetchall()
+    previous = {}
+    affected_dates = set()
+    for row in rows:
+        prior = previous.get(row["instrument_id"])
+        reliable = row["shares_date"] == row["trade_date"]
+        if prior and reliable and prior["shares_date"] == prior["trade_date"]:
+            share_ratio = float(row["shares"]) / float(prior["shares"]) if prior["shares"] else None
+            nav_ratio = float(row["unit_nav"]) / float(prior["unit_nav"]) if prior["unit_nav"] else None
+            split_like = (
+                share_ratio is not None and nav_ratio is not None
+                and (share_ratio >= 1.25 or share_ratio <= 0.80)
+                and abs(share_ratio * nav_ratio - 1) <= 0.15
+            )
+            if split_like:
+                conn.execute(
+                    """UPDATE etf_daily_fact
+                       SET previous_aum=NULL,estimated_net_flow=NULL,flow_rate=NULL,
+                           pct_change=NULL,flow_status='ANOMALOUS',data_status='PARTIAL'
+                       WHERE trade_date=? AND instrument_id=?""",
+                    (row["trade_date"], row["instrument_id"]),
+                )
+                affected_dates.add(row["trade_date"])
+        previous[row["instrument_id"]] = row
+    for trade_date in affected_dates:
+        conn.execute("DELETE FROM category_daily_metric WHERE trade_date=?", (trade_date,))
     # 2026-07-28 与 2026-07-29 的份额均在 7 月 29 日采集，不能构成跨日差分。
     polluted = conn.execute(
         """SELECT COUNT(*) FROM etf_daily_fact
@@ -252,6 +297,7 @@ def migrate(path: str | Path | None = None, create_backup: bool = True) -> dict:
     with connect(db_path) as conn:
         conn.executescript(DDL_V2)
         _apply_v3(conn)
+        _apply_v4(conn)
         if conn.execute(
             "SELECT 1 FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
         ).fetchone():
@@ -504,7 +550,8 @@ def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.
                     :estimated_net_flow,:flow_rate,:flow_status,:source,:data_status,:collected_at)
                 ON CONFLICT(trade_date,instrument_id) DO UPDATE SET
                     close=COALESCE(excluded.close,etf_daily_fact.close),
-                    pct_change=COALESCE(excluded.pct_change,etf_daily_fact.pct_change),
+                    pct_change=CASE WHEN excluded.flow_status='ANOMALOUS' THEN NULL
+                                    ELSE COALESCE(excluded.pct_change,etf_daily_fact.pct_change) END,
                     volume=COALESCE(excluded.volume,etf_daily_fact.volume),
                     amount=COALESCE(excluded.amount,etf_daily_fact.amount),
                     unit_nav=COALESCE(excluded.unit_nav,etf_daily_fact.unit_nav),
@@ -521,9 +568,12 @@ def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.
                     shares_date=COALESCE(excluded.shares_date,etf_daily_fact.shares_date),
                     shares_source=COALESCE(excluded.shares_source,etf_daily_fact.shares_source),
                     shares_updated_at=COALESCE(excluded.shares_updated_at,etf_daily_fact.shares_updated_at),
-                    previous_aum=COALESCE(excluded.previous_aum,etf_daily_fact.previous_aum),
-                    estimated_net_flow=COALESCE(excluded.estimated_net_flow,etf_daily_fact.estimated_net_flow),
-                    flow_rate=COALESCE(excluded.flow_rate,etf_daily_fact.flow_rate),
+                    previous_aum=CASE WHEN excluded.flow_status='ANOMALOUS' THEN NULL
+                                      ELSE COALESCE(excluded.previous_aum,etf_daily_fact.previous_aum) END,
+                    estimated_net_flow=CASE WHEN excluded.flow_status='ANOMALOUS' THEN NULL
+                                            ELSE COALESCE(excluded.estimated_net_flow,etf_daily_fact.estimated_net_flow) END,
+                    flow_rate=CASE WHEN excluded.flow_status='ANOMALOUS' THEN NULL
+                                   ELSE COALESCE(excluded.flow_rate,etf_daily_fact.flow_rate) END,
                     flow_status=excluded.flow_status,
                     source=excluded.source,
                     data_status=CASE WHEN etf_daily_fact.data_status='VALID'

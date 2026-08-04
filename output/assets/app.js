@@ -29,6 +29,8 @@
     meta.classList.remove("skeleton");
     meta.innerHTML=`<span class="flow-state ${esc(d.flow_status.toLowerCase())}">${esc(d.flow_status)}</span>
       <b>${esc(d.trade_date)}</b><span>${d.flow_valid_count}/${d.classified_count} 只可计算 · 覆盖 ${pct(d.flow_coverage)}</span>`;
+    const signalItems=(d.signals?.contrarian_inflows||[]).slice(0,3);
+    const signalStrip=signalItems.length?`<section class="signal-strip"><div><span>逆势承接观察</span><small>${esc(d.signals.disclaimer)}</small></div>${signalItems.map(s=>`<article><b>${esc(s.theme)}</b><em class="positive">${money(s.estimated_net_flow_wan)}</em><strong class="negative">${pct(s.equal_weight_return,2)}</strong><small>${esc(s.category)}</small></article>`).join("")}</section>`:"";
     const categories=d.categories.map(c=>{
       let detail;
       if(c.ranking_mode==="full") {
@@ -44,10 +46,11 @@
         <td class="${cls(c.equal_weight_return)}">${pct(c.equal_weight_return,2)}</td>
       </tr><tr class="ledger-detail-row"><td colspan="4"><div class="ledger-rank-grid ${c.ranking_mode}">${detail}</div></td></tr>`;
     }).join("");
-    root.innerHTML=`<table class="daily-table"><thead><tr><th>ETF 大类</th><th>可计算 / 产品数</th><th>估算净申购</th><th>等权平均涨跌</th></tr></thead>
+    root.innerHTML=`${signalStrip}<table class="daily-table"><thead><tr><th>ETF 大类</th><th>可计算 / ETF只数</th><th>估算净申购</th><th>等权平均涨跌</th></tr></thead>
       <tbody>${categories}<tr class="ledger-total-row"><td><b>已分类总计</b><small>未分类 ${d.unclassified_count} 只另行披露</small></td>
       <td>${d.flow_valid_count} / ${d.classified_count}</td><td class="${cls(d.estimated_net_flow_wan)}">${money(d.estimated_net_flow_wan)}</td>
-      <td class="${cls(d.equal_weight_return)}">${pct(d.equal_weight_return,2)}</td></tr></tbody></table>`;
+      <td class="${cls(d.equal_weight_return)}">${pct(d.equal_weight_return,2)}</td></tr></tbody></table>
+      <p class="ledger-note">${esc(d.universe?.label||"全市场上市 ETF")}口径。${esc(d.universe?.note||"")}</p>`;
   }
   function rows() { return state.overview.by_period[String(state.period)] || []; }
   function total(field) { const xs=rows().map(r=>r[field]).filter(v=>v!=null); return xs.length ? xs.reduce((a,b)=>a+b,0) : null; }
@@ -104,9 +107,11 @@
     const data=await get("data/market_context.json");document.querySelector("#market-status").textContent=data.status;
     const root=document.querySelector("#market-grid");
     if(!data.series?.length){root.innerHTML='<article class="panel na">当前没有通过健康检查的市场辅助字段。</article>';return;}
-    data.series.forEach(item=>{const card=document.createElement("article");card.className="market-card";card.dataset.state=item.state;
-      card.insertAdjacentHTML("beforeend",`<div class="market-meta"><span>${esc(item.source)}</span><b>${esc(item.state)}</b><time>${esc(item.as_of||"N/A")}</time></div><div class="market-chart"></div>`);
-      root.appendChild(card);FlowCharts.line(card.querySelector(".market-chart"),item.data||[],item.field,item.label);});
+    data.series.forEach(item=>{const card=document.createElement("article");card.className=`market-card ${item.chart==="real_gold"?"market-card-wide":""}`;card.dataset.state=item.state;
+      const latest=(item.data||[]).filter(r=>r.real_rate!=null).at(-1);
+      const kpis=item.chart==="real_gold"&&latest?`<div class="market-kpis"><span>实际利率 <b>${Number(latest.real_rate).toFixed(2)}%</b></span><span>美债10Y <b>${Number(latest.us10y).toFixed(2)}%</b></span><span>CPI同比 <b>${Number(latest.cpi_yoy).toFixed(2)}%</b></span><span>CPI发布 <b>${esc(String(latest.cpi_release_date||"N/A").slice(0,10))}</b></span></div>`:"";
+      card.insertAdjacentHTML("beforeend",`<div class="market-meta"><span>${esc(item.source)}</span><b>${esc(item.state)}</b><time>${esc(item.as_of||"N/A")}</time></div>${kpis}<div class="market-chart"></div>${item.note?`<p class="market-note">${esc(item.note)}</p>`:""}`);
+      root.appendChild(card);if(item.chart==="real_gold")FlowCharts.realGold(card.querySelector(".market-chart"),item.data||[]);else FlowCharts.line(card.querySelector(".market-chart"),item.data||[],item.field,item.label);});
   }
   async function methodology() {
     const d=await get("data/latest.json"), el=document.querySelector("#quality-live");

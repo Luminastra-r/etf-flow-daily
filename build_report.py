@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,6 +27,11 @@ MARKET_DEFINITIONS = {
     "bond": {"field": "spread", "label": "中美十年期利差", "source": "AKShare"},
     "margin": {"field": "margin", "label": "融资余额", "source": "AKShare"},
     "dxy": {"field": "dxy", "label": "美元指数", "source": "Yahoo Finance / AKShare"},
+    "real_gold": {
+        "field": "real_rate", "label": "美国实际利率 × COMEX 黄金",
+        "source": "AKShare / Yahoo Finance", "chart": "real_gold",
+        "note": "实际利率=美国10年期国债收益率−美国CPI同比；GC=F 为黄金期货主连代理",
+    },
 }
 
 
@@ -35,7 +40,7 @@ def _clean(value):
         return {k: _clean(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_clean(v) for v in value]
-    if isinstance(value, (pd.Timestamp, datetime)):
+    if isinstance(value, (pd.Timestamp, datetime, date)):
         return value.isoformat()
     if value is pd.NA or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -212,7 +217,8 @@ def _market_payload(load_market: bool):
             )
             series.append({
                 "key": name, **definition, "state": "VALID",
-                "as_of": value_date_text, "data": frame.tail(260).to_dict("records"),
+                "as_of": value_date_text,
+                "data": frame.tail(1300 if name == "real_gold" else 260).to_dict("records"),
                 "health": health,
             })
             continue
@@ -267,6 +273,7 @@ def _daily_table(trade_date: str, instruments: pd.DataFrame,
     )
 
     categories = []
+    signal_candidates = []
     for category in DISPLAY_CATEGORIES:
         group = classified[classified["primary_category"] == category]
         count = len(group)
@@ -296,6 +303,7 @@ def _daily_table(trade_date: str, instruments: pd.DataFrame,
             theme_coverage = len(theme_valid) / len(part)
             themes.append({
                 "theme": theme,
+                "category": category,
                 "etf_count": len(part),
                 "flow_valid_count": len(theme_valid),
                 "flow_coverage": theme_coverage,
@@ -308,6 +316,7 @@ def _daily_table(trade_date: str, instruments: pd.DataFrame,
                     if part["pct_change"].notna().any() else None
                 ),
             })
+        signal_candidates.extend(themes)
         ranked = [item for item in themes if item["estimated_net_flow_wan"] is not None]
         ranked.sort(key=lambda item: (-item["estimated_net_flow_wan"], item["theme"]))
         if len(themes) < 6:
@@ -350,6 +359,25 @@ def _daily_table(trade_date: str, instruments: pd.DataFrame,
         else "BASELINE" if classified["flow_status"].eq("BASELINE").any()
         else "PARTIAL"
     )
+    neutral_flow = float(SETTINGS["concentration_min_flow_wan"])
+    neutral_price = float(SETTINGS["neutral_price_return"])
+    usable_signals = [
+        item for item in signal_candidates
+        if item["estimated_net_flow_wan"] is not None
+        and item["equal_weight_return"] is not None
+    ]
+    contrarian = sorted(
+        [item for item in usable_signals
+         if item["estimated_net_flow_wan"] > neutral_flow
+         and item["equal_weight_return"] < -neutral_price],
+        key=lambda item: (-item["estimated_net_flow_wan"], item["theme"]),
+    )[:5]
+    rally_outflow = sorted(
+        [item for item in usable_signals
+         if item["estimated_net_flow_wan"] < -neutral_flow
+         and item["equal_weight_return"] > neutral_price],
+        key=lambda item: (item["estimated_net_flow_wan"], item["theme"]),
+    )[:5]
     return {
         "trade_date": trade_date,
         "generated_at": generated_at,
@@ -363,6 +391,15 @@ def _daily_table(trade_date: str, instruments: pd.DataFrame,
         "flow_coverage": total_coverage,
         "estimated_net_flow_wan": total_flow,
         "equal_weight_return": equal_return,
+        "universe": {
+            "mode": "ALL_LISTED_ETF", "label": "全市场上市 ETF",
+            "note": "覆盖当前可识别的上市 ETF，并非第三方日报的精选产品池；金额不可直接逐项对齐。",
+        },
+        "signals": {
+            "contrarian_inflows": contrarian,
+            "rally_outflows": rally_outflow,
+            "disclaimer": "描述性资金价格观察，不构成投资建议。",
+        },
         "categories": categories,
     }
 

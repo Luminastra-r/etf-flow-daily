@@ -42,7 +42,12 @@ def _observation(flow_rate, price_return):
 def _weighted_period_return(group: pd.DataFrame):
     rows = []
     for _, item in group.groupby("instrument_id"):
-        item = item.sort_values("trade_date")
+        item = item.sort_values("trade_date").copy()
+        if "flow_status" in item and item["flow_status"].eq("ANOMALOUS").any():
+            continue
+        for column in ["close", "pct_change", "previous_aum"]:
+            if column in item:
+                item[column] = pd.to_numeric(item[column], errors="coerce")
         closes = item.dropna(subset=["close"])
         if len(closes) < 2:
             if len(group["trade_date"].unique()) == 1 and item["pct_change"].notna().any():
@@ -65,7 +70,12 @@ def _weighted_period_return(group: pd.DataFrame):
 def _equal_weight_period_return(group: pd.DataFrame):
     returns = []
     for _, item in group.groupby("instrument_id"):
-        item = item.sort_values("trade_date")
+        item = item.sort_values("trade_date").copy()
+        if "flow_status" in item and item["flow_status"].eq("ANOMALOUS").any():
+            continue
+        for column in ["close", "pct_change"]:
+            if column in item:
+                item[column] = pd.to_numeric(item[column], errors="coerce")
         closes = item.dropna(subset=["close"])
         if len(closes) < 2:
             values = item["pct_change"].dropna()
@@ -103,6 +113,9 @@ def compute_metrics(current_facts: pd.DataFrame, instruments: pd.DataFrame,
     )
     history = current.copy() if old.empty else pd.concat([old, current], ignore_index=True)
     history = history.drop_duplicates(["trade_date", "instrument_id"], keep="last")
+    for column in ["close", "pct_change", "estimated_net_flow", "previous_aum", "flow_rate"]:
+        if column in history:
+            history[column] = pd.to_numeric(history[column], errors="coerce")
     dates = sorted(history["trade_date"].dropna().unique())
     active_counts = instruments.groupby("primary_category")["instrument_id"].nunique().to_dict()
     rows = []

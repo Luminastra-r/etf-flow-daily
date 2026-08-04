@@ -3,3 +3,4 @@ baostock==0.9.3
 pandas>=2.0.0
 plotly>=5.20.0
 pytest>=8.0.0
+yfinance==1.5.2

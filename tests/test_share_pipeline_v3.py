@@ -18,7 +18,7 @@ def _daily(day, shares=100.0):
 
 def _spot(day, shares=100.0):
     return pd.DataFrame([{
-        "代码": "510300", "名称": "沪深300ETF", "最新价": 4.1,
+        "代码": "510300", "名称": "沪深300ETF", "最新价": 4.1, "昨收": 4.05,
         "涨跌幅": 1.0, "成交量": 10.0, "成交额": 100.0,
         "最新份额": shares, "数据日期": day,
         "更新时间": f"{day} 16:00:00+08:00",
@@ -75,7 +75,7 @@ def test_mismatched_spot_date_does_not_override_target_price(tmp_path, monkeypat
                         lambda: "2026-07-29")
     _, facts, _, _ = fetch.fetch_staging("2026-07-29")
     row = facts.iloc[0]
-    assert row["close"] == pytest.approx(4.1)
+    assert row["close"] == pytest.approx(4.05)
     assert pd.isna(row["pct_change"])
     assert row["shares"] == pytest.approx(100)
 
@@ -145,6 +145,45 @@ def test_daily_table_excludes_unclassified_and_uses_decimal_returns():
     assert payload["unclassified_count"] == 1
     assert payload["estimated_net_flow_wan"] == 80.0
     assert payload["equal_weight_return"] == pytest.approx(0.0)
+    assert payload["universe"]["mode"] == "ALL_LISTED_ETF"
+
+
+def test_daily_table_surfaces_contrarian_inflow_signal():
+    instruments = pd.DataFrame([{
+        "instrument_id": "SH.512480", "primary_category": "行业",
+        "secondary_category": "半导体",
+    }])
+    facts = pd.DataFrame([{
+        "instrument_id": "SH.512480", "estimated_net_flow": 299934.0,
+        "pct_change": -7.83, "flow_status": "VALID",
+    }])
+    payload = build_report._daily_table("2026-08-03", instruments, facts, db.now_cn())
+    signal = payload["signals"]["contrarian_inflows"][0]
+    assert signal["theme"] == "半导体"
+    assert signal["estimated_net_flow_wan"] == pytest.approx(299934.0)
+    assert signal["equal_weight_return"] == pytest.approx(-0.0783)
+
+
+def test_share_nav_reciprocal_jump_is_excluded_as_corporate_action(tmp_path, monkeypatch):
+    path = tmp_path / "split.sqlite"
+    monkeypatch.setattr(db, "DB_PATH", path)
+    _patch_sources(monkeypatch, "2026-07-30", 100.0)
+    instruments, first, _, _ = fetch.fetch_staging("2026-07-30")
+    db.upsert_snapshot(instruments, first, pd.DataFrame(), path)
+
+    monkeypatch.setattr(fetch.ak, "fund_etf_fund_daily_em", lambda: _daily("2026-07-31"))
+    monkeypatch.setattr(fetch.ak, "fund_etf_spot_em", lambda: _spot("2026-07-31", 200.0))
+    monkeypatch.setattr(fetch.ak, "fund_etf_scale_sse", lambda date: _sse("2026-07-31", 200.0), raising=False)
+    monkeypatch.setattr(fetch.calendar_service, "latest_completed_trade_date", lambda: "2026-07-31")
+    split_daily = _daily("2026-07-31")
+    split_daily["2026-07-31-单位净值"] = 2.0
+    monkeypatch.setattr(fetch.ak, "fund_etf_fund_daily_em", lambda: split_daily)
+    _, facts, _, warnings = fetch.fetch_staging("2026-07-31")
+    row = facts.iloc[0]
+    assert row["flow_status"] == "ANOMALOUS"
+    assert pd.isna(row["estimated_net_flow"])
+    assert pd.isna(row["pct_change"])
+    assert any("拆分" in warning for warning in warnings)
 
 
 def test_market_payload_has_no_usdcny_definition():

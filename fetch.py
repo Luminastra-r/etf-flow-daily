@@ -104,12 +104,12 @@ def _prepare_daily(raw: pd.DataFrame, expected_date: str | None = None) -> tuple
 def _prepare_spot(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame(columns=[
-            "code", "spot_name", "close", "pct_change", "volume", "amount",
+            "code", "spot_name", "close", "spot_previous_close", "pct_change", "volume", "amount",
             "spot_shares_raw", "spot_shares_date", "spot_updated_at",
         ])
     spot = raw.rename(columns={
         "代码": "code", "名称": "spot_name", "最新份额": "spot_shares_raw",
-        "涨跌幅": "pct_change", "最新价": "close", "成交量": "volume",
+        "涨跌幅": "pct_change", "最新价": "close", "昨收": "spot_previous_close", "成交量": "volume",
         "成交额": "amount", "数据日期": "spot_shares_date",
         "更新时间": "spot_updated_at",
     }).copy()
@@ -118,7 +118,7 @@ def _prepare_spot(raw: pd.DataFrame) -> pd.DataFrame:
         raise RuntimeError(f"ETF 快照缺列: {sorted(required - set(spot.columns))}")
     spot["code"] = spot["code"].map(_safe_code)
     spot = spot.dropna(subset=["code"])
-    for col in ["spot_shares_raw", "pct_change", "close", "volume", "amount"]:
+    for col in ["spot_shares_raw", "pct_change", "close", "spot_previous_close", "volume", "amount"]:
         spot[col] = _to_num(spot[col]) if col in spot else pd.NA
     if "spot_shares_date" not in spot:
         spot["spot_shares_date"] = None
@@ -129,7 +129,7 @@ def _prepare_spot(raw: pd.DataFrame) -> pd.DataFrame:
         lambda x: None if pd.isna(x) else str(x)
     )
     keep = [
-        "code", "spot_name", "close", "pct_change", "volume", "amount",
+        "code", "spot_name", "close", "spot_previous_close", "pct_change", "volume", "amount",
         "spot_shares_raw", "spot_shares_date", "spot_updated_at",
     ]
     return spot[keep].drop_duplicates("code", keep="first")
@@ -290,13 +290,18 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
         .fillna(stage.get("exchange_name")).fillna(stage["code"])
     )
     stage["fund_type"] = stage.get("fund_type").fillna("未知")
-    spot_market_valid = stage["spot_shares_date"] == expected_date
+    # 次日盘前运行时，实时快照的“最新价/涨跌幅”属于新交易日，不能写回目标日。
+    # 对最近已结束交易日使用快照里的“昨收”，其他历史日期仅使用净值接口市价。
+    completed_quote = expected_date == latest_completed
+    previous_close_quote = _to_num(stage.get("spot_previous_close"))
+    if not completed_quote:
+        previous_close_quote = pd.Series(pd.NA, index=stage.index, dtype="Float64")
     stage["close"] = (
-        _to_num(stage.get("close")).where(spot_market_valid)
-        .fillna(_to_num(stage.get("nav_market")))
+        previous_close_quote.fillna(_to_num(stage.get("nav_market")))
     )
-    for col in ["pct_change", "volume", "amount"]:
-        stage[col] = _to_num(stage.get(col)).where(spot_market_valid)
+    stage["pct_change"] = pd.NA
+    stage["volume"] = pd.NA
+    stage["amount"] = pd.NA
     stage["unit_nav"] = _to_num(stage.get("unit_nav"))
 
     exchange_valid = (
@@ -399,7 +404,9 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
     for col in ["prev_close", "prev_shares", "prev_nav"]:
         facts[col] = _to_num(facts[col])
     computed_change = (facts["close"] / facts["prev_close"] - 1) * 100
-    facts["pct_change"] = facts["pct_change"].fillna(computed_change)
+    facts["pct_change"] = computed_change.where(
+        facts["close"].notna() & facts["prev_close"].notna() & (facts["prev_close"] > 0)
+    )
 
     current_share = facts["shares"].notna() & (facts["shares_date"] == trade_date)
     previous_share = facts["prev_shares"].notna() & facts["prev_trade_date"].notna()
@@ -407,7 +414,17 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
     facts["previous_aum"] = (
         facts["prev_shares"] * facts["prev_nav"] * SHARE_TO_YUAN
     ).where(previous_share & facts["prev_nav"].notna() & (facts["prev_nav"] > 0))
-    ready = current_share & previous_share & current_nav & (facts["previous_aum"] > 0)
+    share_ratio = facts["shares"] / facts["prev_shares"]
+    nav_ratio = facts["unit_nav"] / facts["prev_nav"]
+    split_like = (
+        current_share & previous_share & current_nav
+        & ((share_ratio >= 1.25) | (share_ratio <= 0.80))
+        & ((share_ratio * nav_ratio - 1).abs() <= 0.15)
+    )
+    ready = (
+        current_share & previous_share & current_nav
+        & (facts["previous_aum"] > 0) & ~split_like
+    )
     facts["estimated_net_flow"] = (
         (facts["shares"] - facts["prev_shares"]) * facts["unit_nav"]
         * SHARE_TO_YUAN / RESULT_UNIT
@@ -420,6 +437,10 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
     facts.loc[current_share & ~previous_share, "flow_status"] = "BASELINE"
     facts.loc[current_share & previous_share & ~current_nav, "flow_status"] = "DATE_MISMATCH"
     facts.loc[ready, "flow_status"] = "VALID"
+    facts.loc[split_like, "flow_status"] = "ANOMALOUS"
+    facts.loc[split_like, ["previous_aum", "estimated_net_flow", "flow_rate", "pct_change"]] = pd.NA
+    if split_like.any():
+        warnings.append(f"检测到 {int(split_like.sum())} 只 ETF 疑似拆分/份额折算，已从资金流和收益统计剔除")
     facts["data_status"] = (
         ready & facts["close"].notna()
     ).map({True: "VALID", False: "PARTIAL"})

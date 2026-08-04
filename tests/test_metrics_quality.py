@@ -43,6 +43,15 @@ def test_complete_windows_breadth_and_concentration(tmp_path):
     assert result[result["window"] == 20]["estimated_net_flow"].isna().all()
 
 
+def test_period_return_coerces_legacy_text_numbers(tmp_path):
+    path = tmp_path / "metric-text.sqlite"
+    db.migrate(path, create_backup=False)
+    facts = _facts(5)
+    facts["close"] = facts["close"].map(str)
+    result = compute_metrics(facts, _instrument(), "2026-07-24", path=path)
+    assert pd.notna(result[result["window"] == 5].iloc[0]["price_return"])
+
+
 def test_quality_distinguishes_zero_and_missing(tmp_path):
     path = tmp_path / "quality.sqlite"
     db.migrate(path, create_backup=False)
