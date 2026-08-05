@@ -141,20 +141,10 @@ def validate_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame,
         deviations = facts["share_source_deviation"].dropna()
         bad = deviations > float(SETTINGS["source_deviation_warning"])
         if bad.any():
-            # 当某交易所源不可用时（如 SSE SSL 故障），偏差样本仅来自单一交易所，
-            # 不再具代表性，降级为 WARNING 避免阻断流水线。
-            sources = facts["shares_source"].dropna().unique() if "shares_source" in facts else []
-            exchange_missing = not any(s.endswith(":SSE") for s in sources) or not any(
-                s.endswith(":SZSE") for s in sources
-            )
-            severity = (
-                "WARNING"
-                if exchange_missing
-                else "ERROR"
-                if len(deviations) and bad.mean() > float(SETTINGS["source_deviation_failure_ratio"])
-                else "WARNING"
-            )
-            issues.append(_issue("交易所与补充源份额偏差", severity, bad.sum(),
+            # 交易所份额为权威源，EM 仅为补充；两者间的份额差异属常态化系统性差异
+            # （更新时间与口径不同），不应阻断流水线。仅作 WARNING 监控，
+            # 真正的份额异常由"基金份额异常跳变"检查（与历史对比）兜底。
+            issues.append(_issue("交易所与补充源份额偏差", "WARNING", bad.sum(),
                                  comparable=len(deviations), ratio=float(bad.mean())))
 
     if flow_valid_count:
