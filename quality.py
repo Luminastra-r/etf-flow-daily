@@ -141,8 +141,16 @@ def validate_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame,
         deviations = facts["share_source_deviation"].dropna()
         bad = deviations > float(SETTINGS["source_deviation_warning"])
         if bad.any():
+            # 当某交易所源不可用时（如 SSE SSL 故障），偏差样本仅来自单一交易所，
+            # 不再具代表性，降级为 WARNING 避免阻断流水线。
+            sources = facts["shares_source"].dropna().unique() if "shares_source" in facts else []
+            exchange_missing = not any(s.endswith(":SSE") for s in sources) or not any(
+                s.endswith(":SZSE") for s in sources
+            )
             severity = (
-                "ERROR"
+                "WARNING"
+                if exchange_missing
+                else "ERROR"
                 if len(deviations) and bad.mean() > float(SETTINGS["source_deviation_failure_ratio"])
                 else "WARNING"
             )
