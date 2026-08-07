@@ -2,8 +2,10 @@ name: ETF 资金流向日报
 
 on:
   schedule:
-    # 北京时间每日 07:46（= UTC 前一日 23:46），避开整点降低并发峰值
-    - cron: "46 23 * * *"
+    # 北京时间每日 00:47、03:17、05:47；错峰补跑并为 09:00 前发布留出排队余量
+    - cron: "47 16 * * *"
+    - cron: "17 19 * * *"
+    - cron: "47 21 * * *"
   workflow_dispatch:
     inputs:
       trade_date:
@@ -51,6 +53,7 @@ jobs:
           INPUT_REBUILD_PAGE: ${{ inputs.rebuild_page }}
         run: |
           args=(--scheduled-at "$(TZ=Asia/Shanghai date --iso-8601=seconds)" --build-id "${{ github.run_id }}")
+          if [ "${{ github.event_name }}" = "schedule" ]; then args+=(--scheduled-run); fi
           if [ -n "$INPUT_TRADE_DATE" ]; then args+=(--trade-date "$INPUT_TRADE_DATE"); fi
           if [ "$INPUT_FORCE_REFRESH" = "true" ]; then args+=(--force-refresh); fi
           if [ "$INPUT_REBUILD_PAGE" = "true" ]; then args+=(--rebuild-page); fi

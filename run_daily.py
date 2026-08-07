@@ -21,6 +21,7 @@ def _parser():
     parser.add_argument("--force-refresh", action="store_true", help="强制重抓已有交易日")
     parser.add_argument("--rebuild-page", action="store_true", help="仅使用现有 SQLite 重建页面")
     parser.add_argument("--scheduled-at", help="计划运行时间（北京时间 ISO8601）")
+    parser.add_argument("--scheduled-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--build-id", help="GitHub Actions run_id / 构建标识")
     parser.add_argument("--no-market", action="store_true", help="构建时不抓宏观数据（测试用）")
     return parser
@@ -86,34 +87,39 @@ def execute(args) -> dict:
         db.finish_run(run_id, "SKIPPED", expected, warnings=["非交易日，未写入市场事实"])
         return _summary(run_id, "SKIPPED", expected, migration, None, started)
 
+    existing = _existing_snapshot(expected)
+    force_refresh = bool(getattr(args, "force_refresh", False))
+    scheduled_run = bool(getattr(args, "scheduled_run", False))
+    if existing and not force_refresh:
+        if existing["coverage"] >= float(SETTINGS["coverage_warning"]):
+            return _summary(run_id, "UP_TO_DATE", expected, migration, None, started)
+        retry_day = date.fromisoformat(expected) + timedelta(days=1)
+        if scheduled_run and calendar_service.today_cn() != retry_day:
+            return _summary(run_id, "RETAINED", expected, migration, None, started)
+
     db.start_run(run_id, expected, args.scheduled_at)
     try:
-        if not args.force_refresh:
-            existing = db.query(
-                """SELECT COUNT(*) n FROM etf_daily_fact
-                   WHERE trade_date=? AND flow_status='VALID'""", (expected,)
-            )
-            if int(existing.iloc[0]["n"]):
-                build = build_report.build(
-                    expected, load_market=not args.no_market,
-                    status_override={"status": "REBUILT", "scheduled_at": args.scheduled_at,
-                                     "generated_at": db.now_cn(),
-                                     "warnings": ["当日有效数据已存在，仅重建页面"]},
-                    build_id=getattr(args, "build_id", None),
-                )
-                db.finish_run(run_id, "REBUILT", expected, warnings=["当日有效数据已存在，仅重建页面"])
-                db.checkpoint()
-                return _summary(run_id, "REBUILT", expected, migration, build, started)
-
         start = (date.fromisoformat(expected) - timedelta(days=120)).isoformat()
         benchmark, benchmark_warnings = calendar_service.benchmark_closes(start, expected)
         result = fetch.compute_and_store(
-            expected, run_id, benchmark=benchmark, force_refresh=args.force_refresh
+            expected, run_id, benchmark=benchmark, force_refresh=force_refresh,
+            minimum_coverage=existing["coverage"] if existing else None,
         )
         warnings = benchmark_warnings + result.get("source_warnings", []) + [
             f"{x['check_name']}: {x.get('details', {})}"
             for x in result["issues"] if x["severity"] == "WARNING"
         ]
+        if result.get("retained"):
+            warnings.append(
+                f"本次覆盖率 {result['coverage']:.1%} 低于现有版本 "
+                f"{result['retained_coverage']:.1%}，保留现有快照"
+            )
+            db.finish_run(
+                run_id, "RETAINED", expected, result["pool_count"],
+                result["valid_count"], result["retained_coverage"], warnings=warnings,
+            )
+            db.checkpoint()
+            return _summary(run_id, "RETAINED", expected, migration, None, started)
         status = "BASELINE" if result.get("baseline") else (
             "VALID" if result["coverage"] >= float(SETTINGS["coverage_warning"])
             else "PARTIAL"
@@ -163,6 +169,28 @@ def _summary(run_id, status, trade_date, migration, build, started):
     }
     print("[run_daily] " + json.dumps(summary, ensure_ascii=False, default=str))
     return summary
+
+
+def _existing_snapshot(trade_date: str) -> dict | None:
+    counts = db.query(
+        """SELECT COUNT(*) fact_count,
+                  SUM(CASE WHEN flow_status='VALID' AND estimated_net_flow IS NOT NULL
+                           THEN 1 ELSE 0 END) valid_count
+           FROM etf_daily_fact WHERE trade_date=?""",
+        (trade_date,),
+    ).iloc[0]
+    fact_count = int(counts["fact_count"] or 0)
+    if not fact_count:
+        return None
+    pool = db.query("SELECT COUNT(*) n FROM etf_instrument WHERE active=1").iloc[0]["n"]
+    pool_count = max(int(pool or 0), fact_count)
+    valid_count = int(counts["valid_count"] or 0)
+    return {
+        "fact_count": fact_count,
+        "valid_count": valid_count,
+        "pool_count": pool_count,
+        "coverage": valid_count / pool_count if pool_count else 0.0,
+    }
 
 
 def main(argv=None):

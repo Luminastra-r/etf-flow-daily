@@ -1,4 +1,5 @@
 from argparse import Namespace
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -62,10 +63,55 @@ def test_non_trading_day_is_skipped(tmp_path, monkeypatch):
 
 def test_workflow_has_manual_inputs_and_timeout():
     text = Path(".github/workflows/daily.yml").read_text(encoding="utf-8")
+    assert text.count("cron:") == 3
     for token in ["trade_date:", "force_refresh:", "rebuild_page:", "timeout-minutes: 20",
-                  'cron: "46 23 * * *"', "cache: \"pip\"", "--build-id",
+                  'cron: "47 16 * * *"', 'cron: "17 19 * * *"',
+                  'cron: "47 21 * * *"', "cache: \"pip\"", "--build-id",
+                  "--scheduled-run",
                   "etf-flow-daily.pages.dev/data/latest.json"]:
         assert token in text
+
+
+def test_existing_complete_snapshot_is_up_to_date_without_fetch(tmp_path, monkeypatch):
+    path = tmp_path / "run.sqlite"
+    _seed(path)
+    with db.connect(path) as conn:
+        conn.execute(
+            """UPDATE etf_daily_fact
+               SET estimated_net_flow=1,flow_rate=0.01,flow_status='VALID',data_status='VALID'"""
+        )
+    monkeypatch.setattr(db, "DB_PATH", path)
+    monkeypatch.setattr(run_daily.calendar_service, "is_trading_day", lambda _: True)
+    monkeypatch.setattr(
+        run_daily.fetch, "compute_and_store",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("不应重新抓数")),
+    )
+    args = Namespace(
+        trade_date="2026-07-28", force_refresh=False, rebuild_page=False,
+        scheduled_at="2026-07-29T00:47:00+08:00", scheduled_run=True,
+        no_market=True, build_id="test",
+    )
+    result = run_daily.execute(args)
+    assert result["status"] == "UP_TO_DATE"
+
+
+def test_old_partial_snapshot_does_not_retry_outside_next_morning(tmp_path, monkeypatch):
+    path = tmp_path / "run.sqlite"
+    _seed(path)
+    monkeypatch.setattr(db, "DB_PATH", path)
+    monkeypatch.setattr(run_daily.calendar_service, "is_trading_day", lambda _: True)
+    monkeypatch.setattr(run_daily.calendar_service, "today_cn", lambda: date(2026, 7, 30))
+    monkeypatch.setattr(
+        run_daily.fetch, "compute_and_store",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("补跑窗口已结束")),
+    )
+    args = Namespace(
+        trade_date="2026-07-28", force_refresh=False, rebuild_page=False,
+        scheduled_at="2026-07-30T00:47:00+08:00", scheduled_run=True,
+        no_market=True, build_id="test",
+    )
+    result = run_daily.execute(args)
+    assert result["status"] == "RETAINED"
 
 
 def test_instrument_status_derivation():
@@ -78,3 +124,20 @@ def test_instrument_status_derivation():
     assert build_report.instrument_status_counts(instruments, facts, "2026-07-28") == {
         "VALID": 1, "PARTIAL": 1, "STALE": 1, "MISSING": 1,
     }
+
+
+def test_page_headers_are_concise_and_quality_notice_is_available():
+    index = Path("web/index.html").read_text(encoding="utf-8")
+    market = Path("web/market.html").read_text(encoding="utf-8")
+    methodology = Path("web/methodology.html").read_text(encoding="utf-8")
+    app = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert "PRE-MARKET CAPITAL TAPE" not in index
+    assert "缺失就是缺失" not in index
+    assert "把资金流，放回市场环境里" not in market
+    assert "每一个数字，都应当知道自己从哪里来" not in methodology
+    assert "<h1>市场环境</h1>" in market
+    assert "<h1>方法与数据质量</h1>" in methodology
+    assert "source-note" in market
+    assert "quality-alert" in app
+    assert "未分类 ETF 占比" in app

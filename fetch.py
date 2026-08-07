@@ -451,7 +451,8 @@ def fetch_staging(expected_date: str | None = None) -> tuple[pd.DataFrame, pd.Da
 
 
 def compute_and_store(expected_date: str, run_id: str, benchmark=None,
-                      force_refresh: bool = False) -> dict:
+                      force_refresh: bool = False,
+                      minimum_coverage: float | None = None) -> dict:
     instruments, facts, data_date, source_warnings = fetch_staging(expected_date)
     if data_date != expected_date:
         raise RuntimeError(f"数据日期 {data_date} 与请求交易日 {expected_date} 不一致")
@@ -473,9 +474,24 @@ def compute_and_store(expected_date: str, run_id: str, benchmark=None,
         facts, instruments, expected_date, benchmark=benchmark
     )
     quality.validate_metrics(facts, instruments, category_metrics, expected_date)
-    db.upsert_snapshot(instruments, facts, category_metrics)
     db.record_quality_issues(run_id, issues)
+    retained = bool(
+        minimum_coverage is not None
+        and stats["coverage"] < minimum_coverage
+        and not force_refresh
+    )
+    if retained:
+        return {
+            "instruments": instruments, "facts": facts, "metrics": category_metrics,
+            "issues": issues, "source_warnings": source_warnings,
+            "retained": True, "retained_coverage": minimum_coverage, **stats,
+        }
+    db.upsert_snapshot(
+        instruments, facts, category_metrics,
+        deactivate_missing=not stats.get("preserve_universe", False),
+    )
     return {
         "instruments": instruments, "facts": facts, "metrics": category_metrics,
-        "issues": issues, "source_warnings": source_warnings, **stats,
+        "issues": issues, "source_warnings": source_warnings,
+        "retained": False, **stats,
     }

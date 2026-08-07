@@ -492,7 +492,7 @@ def source_health(path=None) -> pd.DataFrame:
 
 
 def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.DataFrame,
-                    path: str | Path | None = None):
+                    path: str | Path | None = None, deactivate_missing: bool = True):
     """一个事务写入全部正式表；新空值不会覆盖已有有效字段。"""
     migrate(path)
     with connect(path) as conn:
@@ -522,7 +522,7 @@ def upsert_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame, metrics: pd.
                 row,
             )
         seen = instruments["instrument_id"].tolist()
-        if seen:
+        if seen and deactivate_missing:
             marks = ",".join("?" for _ in seen)
             conn.execute(f"UPDATE etf_instrument SET active=0 WHERE instrument_id NOT IN ({marks})", seen)
 

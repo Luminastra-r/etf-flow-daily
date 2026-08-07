@@ -5,15 +5,24 @@
   const cls = v => v == null ? "na" : v >= 0 ? "positive" : "negative";
   const esc = value => String(value ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
   const get = url => fetch(url).then(r => { if(!r.ok) throw new Error(`${url}: ${r.status}`); return r.json(); });
+  const warningText = value => {
+    const text=typeof value==="string"?value:JSON.stringify(value), ratio=text.match(/'ratio':\s*([0-9.]+)/), coverage=text.match(/'coverage':\s*([0-9.]+)/);
+    if(text.startsWith("未分类ETF")&&ratio)return `未分类 ETF 占比 ${pct(Number(ratio[1]))}`;
+    if(coverage)return `${text.split(":",1)[0]} ${pct(Number(coverage[1]))}`;
+    return text.replace(/:\s*\{\}\s*$/,"");
+  };
 
   function renderStatus() {
     const d=state.latest, el=document.querySelector("#status-panel"); if(!el)return;
+    const warnings=(d.warnings||[]).map(warningText);
+    const incomplete=d.status!=="VALID"||d.coverage<.95;
+    const alert=(incomplete||warnings.length)?`<div class="quality-alert ${incomplete?"quality-alert-low":""}"><strong>${incomplete?"数据尚不完整，已启用错峰补跑":"数据提示"}</strong>${warnings.length?`<ul>${warnings.slice(0,3).map(x=>`<li>${esc(x)}</li>`).join("")}${warnings.length>3?`<li>另有 ${warnings.length-3} 项提示</li>`:""}</ul>`:""}</div>`:"";
     el.innerHTML=`<span class="status-pill">${esc(d.status)}</span>
       <div class="status-row"><span>数据交易日</span><b>${esc(d.trade_date)}</b></div>
       <div class="status-row"><span>全量 ETF 池</span><b>${d.pool_count.toLocaleString()} 只</b></div>
       <div class="status-row"><span>资金流有效 / 缺失</span><b>${d.valid_count} / ${d.missing_count}</b></div>
       <div class="status-row"><span>资金流 / 行情覆盖</span><b class="${d.coverage<.8?"negative":"positive"}">${pct(d.coverage)} / ${pct(d.market_coverage)}</b></div>
-      <div class="status-row"><span>分类版本</span><b>${esc(d.classification_version)}</b></div>`;
+      <div class="status-row"><span>分类版本</span><b>${esc(d.classification_version)}</b></div>${alert}`;
   }
   function themeRows(items) {
     return items.map((r,i)=>`<div class="ledger-theme-row">
@@ -115,7 +124,7 @@
   }
   async function methodology() {
     const d=await get("data/latest.json"), el=document.querySelector("#quality-live");
-    el.innerHTML=`<div class="status-row"><span>数据交易日</span><b>${d.trade_date}</b></div><div class="status-row"><span>覆盖率</span><b>${pct(d.coverage)}</b></div><div class="status-row"><span>分类版本</span><b>${esc(d.classification_version)}</b></div><div class="warning-list">${(d.warnings||[]).map(x=>`<p>△ ${esc(typeof x==="string"?x:JSON.stringify(x))}</p>`).join("")||"<p>无构建警告</p>"}</div>`;
+    el.innerHTML=`<div class="status-row"><span>数据交易日</span><b>${d.trade_date}</b></div><div class="status-row"><span>覆盖率</span><b>${pct(d.coverage)}</b></div><div class="status-row"><span>分类版本</span><b>${esc(d.classification_version)}</b></div><div class="warning-list">${(d.warnings||[]).map(x=>`<p>△ ${esc(warningText(x))}</p>`).join("")||"<p>无构建警告</p>"}</div>`;
   }
   document.addEventListener("DOMContentLoaded",()=>{const page=document.body.dataset.page;({dashboard,market,methodology}[page]?.()).catch(err=>{console.error(err);document.querySelector("main").insertAdjacentHTML("afterbegin",`<p class="negative">数据加载失败：${esc(err.message)}</p>`);});});
 })();

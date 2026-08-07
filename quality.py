@@ -69,7 +69,14 @@ def validate_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame,
         flow_valid = facts["estimated_net_flow"].notna()
         baseline = pd.Series(False, index=facts.index)
 
-    pool_count = len(instruments)
+    incoming_pool_count = len(instruments)
+    previous = db.query("SELECT COUNT(*) n FROM etf_instrument WHERE active=1", path=path)
+    previous_count = int(previous.iloc[0]["n"]) if not previous.empty else 0
+    preserve_universe = bool(
+        previous_count
+        and incoming_pool_count < previous_count * (1 - float(SETTINGS["pool_change_warning"]))
+    )
+    pool_count = max(incoming_pool_count, previous_count) if preserve_universe else incoming_pool_count
     market_valid_count = int(market_valid.sum())
     share_valid_count = int(share_valid.sum())
     flow_valid_count = int(flow_valid.sum())
@@ -82,26 +89,17 @@ def validate_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame,
         and int(baseline.sum()) >= int(share_valid.sum() * 0.8)
     )
 
-    if market_coverage < float(SETTINGS["coverage_failure"]):
-        issues.append(_issue("行情有效覆盖率", "ERROR", pool_count - market_valid_count,
-                             coverage=market_coverage))
-    elif market_coverage < float(SETTINGS["coverage_warning"]):
+    if market_coverage < float(SETTINGS["coverage_warning"]):
         issues.append(_issue("行情有效覆盖率", "WARNING", pool_count - market_valid_count,
                              coverage=market_coverage))
 
-    if share_coverage < float(SETTINGS["coverage_failure"]):
-        issues.append(_issue("份额有效覆盖率", "ERROR", pool_count - share_valid_count,
-                             coverage=share_coverage))
-    elif share_coverage < float(SETTINGS["coverage_warning"]):
+    if share_coverage < float(SETTINGS["coverage_warning"]):
         issues.append(_issue("份额有效覆盖率", "WARNING", pool_count - share_valid_count,
                              coverage=share_coverage))
 
     if baseline_run:
         issues.append(_issue("可靠份额基线", "WARNING", share_valid_count,
                              message="首次可靠快照仅建立基线，资金流保持 N/A"))
-    elif flow_coverage < float(SETTINGS["coverage_failure"]):
-        issues.append(_issue("资金流有效覆盖率", "ERROR", pool_count - flow_valid_count,
-                             coverage=flow_coverage))
     elif flow_coverage < float(SETTINGS["coverage_warning"]):
         issues.append(_issue("资金流有效覆盖率", "WARNING", pool_count - flow_valid_count,
                              coverage=flow_coverage))
@@ -111,13 +109,12 @@ def validate_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame,
         issues.append(_issue("未分类ETF", "WARNING", unclassified,
                              ratio=unclassified / pool_count))
 
-    previous = db.query("SELECT COUNT(*) n FROM etf_instrument WHERE active=1", path=path)
-    previous_count = int(previous.iloc[0]["n"]) if not previous.empty else 0
     if previous_count:
-        change = abs(pool_count - previous_count) / previous_count
+        change = abs(incoming_pool_count - previous_count) / previous_count
         if change > float(SETTINGS["pool_change_warning"]):
             issues.append(_issue("ETF池数量突变", "WARNING",
-                                 abs(pool_count - previous_count), change=change))
+                                 abs(incoming_pool_count - previous_count), change=change,
+                                 preserved=preserve_universe))
 
     prior_shares = db.query(
         """SELECT f.instrument_id,f.shares FROM etf_daily_fact f
@@ -172,6 +169,7 @@ def validate_snapshot(instruments: pd.DataFrame, facts: pd.DataFrame,
         "share_valid_count": share_valid_count,
         "share_coverage": share_coverage,
         "baseline": baseline_run,
+        "preserve_universe": preserve_universe,
     }
     if errors:
         raise QualityGateError(issues)
